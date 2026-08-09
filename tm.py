@@ -408,6 +408,13 @@ def main(argv: list[str] | None = None) -> int:
     args.vars = _parse_vars(args.var)
     st = Style()
     store = Store(args.root)
+    # 任何一条命令都先把 queue/ runs/ 建出来。懒创建的话，一个没跑过 tm 的仓库里
+    # 根本看不到队列目录，而 README 和 tm ls 都在让你「cp 一个 yaml 进去」。
+    # 写不了不在这里报——cmd_run 的 check_writable() 会给出更准确的那句话。
+    try:
+        store.ensure()
+    except OSError:
+        pass
 
     handlers = {None: cmd_run, "run": cmd_run, "ls": cmd_ls, "add": cmd_add,
                 "check": cmd_check, "attach": cmd_attach, "clean": cmd_clean,

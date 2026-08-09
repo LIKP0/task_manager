@@ -247,7 +247,13 @@ def load_plan(path: Path, cli_vars: dict[str, str] | None = None,
     elif doc.get("cwd"):
         cwd = Path(substitute(str(doc["cwd"]), variables, f"{path}: cwd"))
     else:
-        cwd = path.parent            # 默认相对 task list 自身，而不是你 cd 到哪
+        # 必填，没有缺省值。曾经默认取「yaml 所在目录」，但 `tm add` 会把 list
+        # 拷进 queue/，于是同一份 yaml 在 `tm check` 时算出一个 cwd、真正排队执行时
+        # 算出另一个（queue/ 自己）。命令里的相对路径会跟着一起漂，而且漂得很安静。
+        raise ConfigError(
+            f"{path}: missing 'cwd:' — 它决定 tmux pane 的起始目录，也就是命令里所有"
+            f"相对路径（脚本、config、输出目录）的解析基准。\n"
+            f"      写成绝对路径，例如：  cwd: ~/my_project")
     cwd = cwd.expanduser().resolve()
     if not cwd.is_dir():
         raise ConfigError(f"{path}: cwd not found: {cwd}")

@@ -79,7 +79,7 @@ wait:                    # 可选：等卡够用了再上机。不写这块就�
   gpu_index: any         # any | 0 | [0, 1]
   stable_for: 120        # 条件要连续满足 120 秒才算数
 
-cwd: ~/my_project  # 所有命令的工作目录
+cwd: ~/my_project  # 必填。所有命令的工作目录
 
 vars:                    # {KEY} 占位符
   CFG: config/ccfm_2p5d_fused_gauss_tsample.yaml
@@ -94,7 +94,7 @@ tasks:
 | 顶层键 | 说明 |
 |---|---|
 | `tasks` | **必填**，按顺序执行 |
-| `cwd` | 工作目录，默认是 **yaml 文件自己所在的目录**（不是你 cd 到哪） |
+| `cwd` | **必填**。tmux pane 的起始目录，也就是命令里所有相对路径（脚本、config、输出目录）的解析基准。没有缺省值——`tm add` 会把 list 拷进 `queue/`，任何「相对 yaml 自身」的默认值都会跟着漂 |
 | `vars` | `{KEY}` 的值，`-v KEY=VALUE` 可覆盖 |
 | `name` | 这个 list 的名字，进 run 目录名和 tmux 会话名。默认取文件名（剥掉 `010_` 这种排序前缀） |
 | `wait` | 上机条件，见下 |
