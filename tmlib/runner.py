@@ -1,10 +1,8 @@
 """tmux 层：把一个 task 丢进一个 tmux 会话，然后隔着进程边界观察它。
 
-tm 不是 task 的父进程——真正 `wait()` 到退出码的是 tmux pane 里那个 sh。
-它把退出码写进一个文件，这就是唯一的跨进程通道：
-
-    ( <cmd> ); rc=$?; echo $rc > NN.rc; [ $rc -eq 0 ] && exit 0; exec bash -i
-    └ 你的命令      └ 亲爹拿到的真值  └ 落盘        └ 成功即消失    └ 失败则钉住现场
+tm 不是 task 的父进程——真正 `wait()` 到退出码的是 tmux pane 里那个 bash。
+它把退出码写进一个文件，这就是唯一的跨进程通道。那段包装不是拼在命令行上的，
+而是**落成 run 目录里的 `NN.sh`**，tmux 收到的只有一句 `bash NN.sh`（见 write_script）。
 
 由此得到一张三态表，tm 每个 tick 查一次：
 
@@ -14,6 +12,11 @@ tm 不是 task 的父进程——真正 `wait()` 到退出码的是 tmux pane �
 
 第三态是承重墙：**没有凭据就当失败**。少了它，一个被硬杀的 train
 会被读成成功，然后 test 抱着半个 checkpoint 跑下去。
+
+反过来「假成功」是不允许存在的，所以 rc 的取值路径要经得起推敲：
+写不进盘 -> 无 rc -> 当失败；被硬杀 -> 无 rc -> 当失败；rc 文件用 rename 落地，
+不存在读到半截。唯一能骗过它的是命令自己把失败吞掉（管道、后台化），
+所以包装脚本开了 `pipefail`——见 write_script 里的注释。
 """
 
 from __future__ import annotations
@@ -29,8 +32,14 @@ RUNNING = "running"
 DONE = "done"
 LOST = "lost"
 
+# 跑包装脚本的 shell。必须是 bash：`set -o pipefail` 在 dash/sh 里没有，
+# 而没有它，`train.py | tee log` 里 train 崩了也会得到 rc=0（实测）。
+# 没装 bash 就退回 sh，同时不写 pipefail——功能降级，但不会语法错误。
+BASH = shutil.which("bash")
+SCRIPT_SHELL = BASH or "/bin/sh"
+
 # 失败后钉住 pane 用的交互 shell。bash 会读 ~/.bashrc，attach 进去 conda 是可用的。
-HOLD_SHELL = "bash" if shutil.which("bash") else "sh"
+HOLD_SHELL = "bash" if BASH else "sh"
 
 
 class TmuxError(RuntimeError):
@@ -64,6 +73,52 @@ def list_sessions() -> list[str]:
     return [line.strip() for line in res.stdout.splitlines() if line.strip()]
 
 
+def write_script(path: Path, cmd: str, cwd: Path, rc_file: Path, label: str) -> None:
+    """把一步任务写成一个自足的 bash 脚本，这就是 tmux 真正执行的东西。
+
+    落成文件而不是拼在 tmux 命令行上，买到四件事：
+      1. shell 无关——tmux 用 default-shell 执行命令串，不能假设那是 POSIX shell
+      2. 能开 `set -o pipefail`，也能安全地写多行，不用跟嵌套引号搏斗
+      3. 事后能看到当时到底跑了什么，复现失败就是 `bash NN.sh`
+      4. 跟 rc 文件、队列目录一样，状态摊在文件系统上，没有只存在于内存里的东西
+    """
+    rc_tmp = Path(f"{rc_file}.tmp")
+    lines = [
+        f"#!{SCRIPT_SHELL}",
+        f"# tm: {label}",
+        "# 这就是 tm 交给 tmux 跑的全部内容。可以直接执行它来复现这一步。",
+    ]
+    if BASH:
+        # 管道的退出码默认只看最后一个命令：`python train.py | tee log` 里
+        # train 崩了、tee 成功，$? 依然是 0，于是 tm 把失败读成成功、
+        # 抱着半个 checkpoint 往下跑 test。pipefail 把它掰回来。
+        lines.append("set -o pipefail")
+    lines += [
+        # 脚本自己 cd，所以脱离 tm 单独执行也是对的（tmux 的 -c 只管 pane 的初始 cwd）
+        f"cd {shlex.quote(str(cwd))} || exit 1",
+        "",
+        # 命令套在子 shell 里跑。不套的话，命令自己写了 `exit`（或者以 exec 收尾）
+        # 会把包装一起带走，rc 文件永远写不出来，tm 就把一次正常的失败
+        # 读成了「无凭据 = LOST」。子 shell 把 exit 挡在里面，$? 照样是真值。
+        f"( {cmd} )",
+        "rc=$?",
+        "",
+        # 先写临时文件再 rename。rename 是原子的，所以 rc 文件要么不存在、
+        # 要么内容完整——「读到半截」这类问题从「已处理」变成「不可能发生」。
+        # 写不进去时 && 短路，不留下 rc 文件，tm 判 LOST（当失败），方向是安全的。
+        f"echo $rc > {shlex.quote(str(rc_tmp))} && "
+        f"mv {shlex.quote(str(rc_tmp))} {shlex.quote(str(rc_file))}",
+        "",
+        # 成功就自己消失（不留垃圾会话），失败就钉在原地：
+        # pane 保留完整 scrollback，attach 进去是个站在 job cwd 和环境里的交互 shell。
+        "[ $rc -eq 0 ] && exit 0",
+        f"exec {HOLD_SHELL} -i",
+        "",
+    ]
+    path.write_text("\n".join(lines))
+    path.chmod(0o755)
+
+
 class Session:
     """一个 tmux 会话 = 一个正在跑（或已经死掉）的 task。"""
 
@@ -85,22 +140,22 @@ class Session:
         # 而这两个调用点只影响显示，不参与「跑完没有」的判定。
         return self.name
 
-    def launch(self, cmd: str, cwd: Path, env: dict[str, str]) -> None:
-        """起会话。命令跑完会把退出码写进 rc_file。"""
+    def launch(self, cmd: str, cwd: Path, env: dict[str, str], script: Path) -> None:
+        """起会话。命令跑完会把退出码写进 rc_file。
+
+        `script` 是包装脚本的落点（run 目录里的 `NN.sh`）。
+        """
         if self.alive():
             raise TmuxError(f"session {self.name} already exists — "
                             f"kill it first: tmux kill-session -t {self.name}")
-        # 命令套在子 shell 里跑。不套的话，命令自己写了 `exit`（或者以 exec 收尾）
-        # 会把包装 shell 一起带走，rc 文件永远写不出来，tm 就把一次正常的失败
-        # 读成了「无凭据 = LOST」。子 shell 把 exit 挡在里面，$? 照样是真值。
-        wrapper = (
-            f"( {cmd} ); rc=$?; echo $rc > {shlex.quote(str(self.rc_file))}; "
-            f"[ $rc -eq 0 ] && exit 0; exec {HOLD_SHELL} -i"
-        )
+        write_script(script, cmd, cwd, self.rc_file, self.name)
         args = ["new-session", "-d", "-s", self.name, "-c", str(cwd)]
         for key, value in env.items():
             args += ["-e", f"{key}={value}"]
-        args.append(wrapper)
+        # 交给 tmux 的就这一句。tmux 是拿 default-shell（默认 $SHELL）来 -c 执行它的，
+        # 而 `bash <path>` 在 fish / csh / zsh 里都是合法的一条命令调用——
+        # 把包装的 shell 语法关在文件里，就不用假设用户的登录 shell 是 POSIX 的。
+        args.append(f"{SCRIPT_SHELL} {shlex.quote(str(script))}")
         _tmux(*args)
 
     def alive(self) -> bool:

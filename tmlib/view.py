@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import sys
 from datetime import datetime
 
@@ -143,8 +144,25 @@ def render(store: Store, st: Style, recent: int = 5) -> list[str]:
 
 
 def _lock_holder(store: Store) -> str:
-    """锁文件里写着谁拿着它。空 = 没人在跑。"""
+    """谁拿着锁。空 = 没人在跑。
+
+    判据是「能不能非阻塞地抢到锁」而不是文件内容：tm 被硬杀时内核只回收 flock，
+    那行字会留在文件里，光读就会指着一个早没了的 pid 说它还在跑。
+    """
+    path = store.root / "lock"
     try:
-        return (store.root / "lock").read_text().strip()
+        text = path.read_text().strip()
     except OSError:
         return ""
+    if not text:
+        return ""
+    try:
+        with path.open("a+") as fh:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return text                    # 抢不到 = 真的有 tm 拿着
+            fcntl.flock(fh, fcntl.LOCK_UN)
+    except OSError:
+        return text                            # 连打开都不行，只能信文件内容
+    return ""                                  # 抢得到 = 上一个 tm 是被硬杀的

@@ -120,6 +120,14 @@ class Run:
         """第 index 步（1-based）的退出码文件。task 自己往这里写。"""
         return self.path / f"{index:02d}.rc"
 
+    def script_path(self, index: int) -> Path:
+        """第 index 步的包装脚本，也就是 tmux 真正执行的东西。
+
+        留在 run 目录里是有用的：事后能看到当时到底跑了什么，
+        复现那一步就是 `bash NN.sh`。
+        """
+        return self.path / f"{index:02d}.sh"
+
     def rc(self, index: int) -> int | None:
         """读第 index 步的退出码；还没写出来就返回 None。"""
         try:
@@ -129,7 +137,8 @@ class Run:
         try:
             return int(text)
         except ValueError:
-            # 文件在、内容不是数字：包装脚本被打断在写一半。当失败处理。
+            # 文件在、内容不是数字。包装脚本是先写 .tmp 再 rename 的，正常路径上
+            # 到不了这里；留着是防手改和防怪事，方向仍然是「看不懂就当失败」。
             return 1 if text else None
 
     def scan(self) -> tuple[int, int | None, int | None]:
@@ -193,9 +202,11 @@ class Store:
         rc 文件写不进去的话，跑成功的任务也会被判成失败（无 rc = 死了没报告），
         与其跑到一半才发现，不如现在就炸。
         """
-        self.ensure()
-        probe = self.root / ".writable"
+        # ensure() 也得包在里面：根目录建不出来时 mkdir 就抛 PermissionError 了，
+        # 漏在外面的话用户看到的是一坨 traceback，而不是下面这句话。
         try:
+            self.ensure()
+            probe = self.root / ".writable"
             probe.write_text("ok")
             probe.unlink()
         except OSError as exc:

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# 注意：pane 只从 tm 继承 PATH，其余环境变量取自 tmux server 首次启动时的环境（实测 3.2a）。
+# 所以 python 找得对，但 conda activate 才有的 CONDA_PREFIX / LD_LIBRARY_PATH 会丢。
 """tm —— 把 task list 排进队列，等到卡就自动上机。
 
 每个 task 跑在自己的 tmux 会话里，tm 只做三件事：按顺序扫队列、看谁能上机、
@@ -26,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 
 from tmlib import runner
-from tmlib.config import ConfigError, check_device_settings, load_plan
+from tmlib.config import ConfigError, check_device_settings, load_plan, unescape_braces
 from tmlib.gpu import GpuPool
 from tmlib.store import LockBusy, Store
 from tmlib.view import Style, render
@@ -152,8 +154,8 @@ def _launch(run, idx: int, rec, sess: runner.Session, st: Style) -> None:
     if run.gpus:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in run.gpus)
     try:
-        sess.launch(rec.cmd, Path(run.cwd), env)
-    except runner.TmuxError as exc:
+        sess.launch(rec.cmd, Path(run.cwd), env, run.script_path(idx))
+    except (runner.TmuxError, OSError) as exc:
         run.set_state("aborted", note=str(exc))
         print(st.red(f"tm: cannot launch {run.name} step {idx}: {exc}"))
         return
@@ -229,7 +231,9 @@ def cmd_add(store: Store, args, st: Style) -> int:
             rc = 2
             continue
         try:
-            load_plan(src)                    # 先验一遍，别把坏 yaml 放进队列
+            # 带上 -v：队列里的 yaml 是 run 的时候用当时 tm 的 -v 重新解析的，
+            # 这里不传的话，add 这一关会比现实更严，把能跑的 list 拦在门外。
+            load_plan(src, cli_vars=args.vars)  # 先验一遍，别把坏 yaml 放进队列
         except ConfigError as exc:
             print(st.red(f"error: {src}: {exc}"), file=sys.stderr)
             rc = 2
@@ -257,7 +261,9 @@ def cmd_check(store: Store, args, st: Style) -> int:
     else:
         print(st.cyan("  [wait] ") + "no gpu requirement — starts immediately")
     for i, t in enumerate(plan.tasks, start=1):
-        print(f"  {st.cyan(f'[{i}] {t.name}')}  {t.cmd}")
+        # 显示前展开 `{{` / `}}`，否则 check 给你看的和 shell 真正收到的不是一回事。
+        # `{GPU}` 留着不动——卡要等 claim 那一刻才定，这里还不知道。
+        print(f"  {st.cyan(f'[{i}] {t.name}')}  {unescape_braces(t.cmd)}")
     if spec.manages_gpu:
         problems = check_device_settings(plan.tasks, plan.cwd, spec.gpus)
         for msg in problems:
