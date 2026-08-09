@@ -1,0 +1,6 @@
+# 这个目录放你自己的 task list，内容全部 gitignore 掉了（实验清单改得勤，
+# 不该弄脏工具仓库的历史）。留这个文件只是为了 clone 下来时目录还在。
+#
+# 根目录的 task_list.yaml 是 tracked 的模板，照着抄。
+#
+#   tm add lists/ccfm_c.yaml

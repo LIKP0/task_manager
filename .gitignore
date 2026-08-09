@@ -10,3 +10,8 @@ testbench/_tmroot/
 /lock
 /paused
 /.writable
+
+# 你自己的 task list。目录保留（.gitkeep），内容不进版本控制——
+# 实验清单改得勤，跟工具的历史混在一起没意义。模板见根目录 task_list.yaml。
+/lists/*
+!/lists/.gitkeep

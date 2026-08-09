@@ -9,7 +9,7 @@
 ```bash
 ln -s ~/task_manager/tm.py ~/.local/bin/tm    # 装一下，之后在哪都能用
 
-tm add ~/my_project/lists/ccfm_c.yaml   # 加进队列（就是 cp 一份进去）
+tm add lists/ccfm_c.yaml     # 加进队列（就是 cp 一份进 queue/）
 tm                           # 起调度器（建议挂在 tmux 里）
 tm ls                        # 看进度。tm 在不在跑都能用
 ```
