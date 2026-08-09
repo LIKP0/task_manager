@@ -9,7 +9,7 @@
 ```bash
 ln -s ~/task_manager/tm.py ~/.local/bin/tm    # 装一下，之后在哪都能用
 
-tm add lists/ccfm_c.yaml     # 加进队列
+tm add ~/my_project/lists/ccfm_c.yaml   # 加进队列（就是 cp 一份进去）
 tm                           # 起调度器（建议挂在 tmux 里）
 tm ls                        # 看进度。tm 在不在跑都能用
 ```
@@ -17,14 +17,15 @@ tm ls                        # 看进度。tm 在不在跑都能用
 ## 它是怎么组织的
 
 tm 自己**不持有任何权威状态**。队列是一个目录，进度是任务自己写下的退出码文件，
-全都在 `~/.tm/` 底下。所以：
+全都在**仓库目录**底下（`tm.py` 挨着的地方，不是 `~/.tm`——藏在家目录的点目录里不好翻）。
+所以：
 
 - tm 随时可以被杀掉重启，进度不丢
 - `tm ls` 是另一个进程，tm 没运行时照样能看
 - 你可以在 tm 没跑的时候手改队列
 
 ```
-~/.tm/
+~/task_manager/               # 全部 .gitignore 掉了：运行时状态不是代码
   lock                        单实例互斥（flock，进程一死内核自动释放）
   queue/010_ccfm_c.yaml       在这儿 = 还没开始。手动 cp 进来等价于 tm add
   runs/20260808_143301_ccfm_c/
@@ -56,7 +57,7 @@ tm [-v KEY=VALUE] [--root DIR] <子命令>
 | 选项 | 属于 | 作用 |
 |---|---|---|
 | `-v KEY=VALUE` | 全局 | 覆盖 yaml 里 `vars:` 的值，可重复。**必须写在子命令前面** |
-| `--root DIR` | 全局 | 覆盖 `~/.tm`，也可以用环境变量 `TM_ROOT`。测试时用 |
+| `--root DIR` | 全局 | 覆盖状态目录（默认 = 仓库目录），也可以用环境变量 `TM_ROOT`。测试时用 |
 | `--poll SEC` | `run` | 轮询间隔，默认 10 秒 |
 | `--once` | `run` | 队列跑空就退出，不待命 |
 | `--no-device-check` | `run` | 跳过 `trainer.devices` 静态检查 |
@@ -64,7 +65,7 @@ tm [-v KEY=VALUE] [--root DIR] <子命令>
 | `--seq N` | `add` | 指定排序号，默认排到最后 |
 
 `tm run` 的退出码说的是**调度器**的事，不是任务的事：`0` 正常结束 ·
-`2` 已经有一个 tm 在跑 / `~/.tm` 写不了 · `130` Ctrl-C。
+`2` 已经有一个 tm 在跑 / 状态目录写不了 · `130` Ctrl-C。
 任务成败去 `tm ls` 看——`tm run --once` 即使有 list 失败了也返回 0。
 
 Ctrl-C 只停调度，**已经起来的 task 不受影响**，还在各自的 tmux 里跑着。重新 `tm` 会接着推进。
@@ -183,7 +184,7 @@ for 每个待跑的 list（文件名顺序）:
 
 ### 手改队列
 
-`~/.tm/queue/` 就是个普通目录，改优先级 = `mv` 改名，取消 = `rm`，禁用一条但先留着 =
+`queue/` 就是个普通目录，改优先级 = `mv` 改名，取消 = `rm`，禁用一条但先留着 =
 改成 `.yaml.off`（`queued()` 按后缀过滤，非 `.yaml`/`.yml` 的它看不见）。
 这些都是**原子**操作，tm 的 tick 要么看到改之前、要么看到改之后，没有中间态。
 
@@ -194,7 +195,7 @@ for 每个待跑的 list（文件名顺序）:
 
 ```bash
 tm add list.yaml                        # 内部就是先写 .tmp 再 rename
-cp list.yaml ~/.tm/queue/015_x.yaml.tmp && mv ~/.tm/queue/015_x.yaml{.tmp,}
+cp list.yaml queue/015_x.yaml.tmp && mv queue/015_x.yaml{.tmp,}
 ```
 
 要连着改好几个文件、不希望改到一半有东西被捡走，用 `tm hold`：
@@ -206,7 +207,7 @@ tm resume
 ```
 
 `hold` 只按住「**扫队列起新 list**」这一件事。`tm` 在不在跑都能按，
-它就是 `~/.tm/paused` 这个文件在不在。
+它就是仓库目录下 `paused` 这个文件在不在。
 
 ## 怎么判断一步跑完了
 
@@ -224,7 +225,7 @@ tm 不是 task 的父进程——真正 `wait()` 到退出码的是 tmux pane �
 
 整个设计只保证一个方向：**可能把成功误报成失败，绝不会把失败误报成成功。**
 （写不进盘 → 无 rc → 当失败；被硬杀 → 无 rc → 当失败。
-所以 tm 开跑前会先验一遍 `~/.tm` 可写，不然跑到一半才发现太亏。）
+所以 tm 开跑前会先验一遍状态目录可写，不然跑到一半才发现太亏。）
 
 ### 包装脚本
 
@@ -270,7 +271,7 @@ tm 注入两个环境变量：`PYTHONUNBUFFERED=1`，以及抢到卡时的 `CUDA
     | Traceback (most recent call last):
     | FileNotFoundError: no such checkpoint: ...
     现场还在：tmux attach -t tm-ccfm_c-02-test
-    /home/me/.tm/runs/20260808_143301_ccfm_c
+    /home/me/task_manager/runs/20260808_143301_ccfm_c
 ```
 
 后面的步骤不会跑。`tm ls` 里这个 list 显示成 `FAILED  ccfm_c  1/3`。

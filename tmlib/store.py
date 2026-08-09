@@ -3,7 +3,7 @@
 整个 tm 的真相都在这里，内存里没有任何权威状态——tm 随时可以被杀掉重启，
 甚至你可以在 tm 没运行的时候直接手改这些文件。
 
-    ~/.tm/
+    <仓库目录>/                      默认就是 tm.py 所在的地方，不是 ~/.tm
       lock                          flock 互斥，防止两个终端各跑一个 tm
       paused                        在 = 不扫队列（tm hold / tm resume）
       queue/
@@ -18,6 +18,10 @@
 
 关键的划分：`run.yaml` 是 tm 写的「计划」，`NN.rc` 是 task 写的「结果」。
 tm 死了，rc 文件照样在长；rc 文件是什么，tm 说了不算。
+
+放仓库里而不是 ~/.tm：队列和 run 记录是你要经常翻的东西，藏在家目录的点目录里
+不好找。代价是它们跟代码同处一个 git 仓库，所以全部进 .gitignore——
+运行时状态不该被版本控制，也不该被 `git clean -xdf` 之外的操作碰到。
 """
 
 from __future__ import annotations
@@ -35,7 +39,10 @@ import yaml
 
 from .config import Plan, list_name, resolve
 
-DEFAULT_ROOT = Path.home() / ".tm"
+# 默认把状态放在仓库目录里（tmlib/ 的上一级），不是 ~/.tm。
+# 用 __file__ 而不是 cwd：tm 会被 symlink 进 PATH、从任意目录调用，
+# .resolve() 会把 symlink 解开，所以指向的始终是真正的仓库。
+DEFAULT_ROOT = Path(__file__).resolve().parent.parent
 
 # run 的终态。到了这些状态就不再动它了。
 TERMINAL = {"done", "failed", "lost", "timeout", "aborted"}

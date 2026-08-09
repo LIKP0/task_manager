@@ -2,3 +2,11 @@ __pycache__/
 *.pyc
 testbench/_out/
 testbench/_tmroot/
+
+# tm 的运行时状态。默认就落在仓库目录里（不是 ~/.tm），方便随手翻，
+# 但它不是代码：队列内容、run 记录、锁、暂停标记都不进版本控制。
+/queue/
+/runs/
+/lock
+/paused
+/.writable
