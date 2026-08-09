@@ -60,7 +60,10 @@ def render(store: Store, st: Style, recent: int = 5) -> list[str]:
     sessions = set(runner.list_sessions())
 
     holder = _lock_holder(store)
-    out.append(st.bold("tm: ") + (st.green(holder) if holder else st.dim("not running")))
+    line = st.bold("tm: ") + (st.green(holder) if holder else st.dim("not running"))
+    if store.paused():
+        line += st.yellow("   [队列已暂停 · tm resume]")
+    out.append(line)
 
     # ---- 在跑的 ------------------------------------------------------------
     active = store.active()
@@ -99,6 +102,7 @@ def render(store: Store, st: Style, recent: int = 5) -> list[str]:
             where = ("gpu " + ",".join(map(str, spec.gpu_index))
                      if spec.gpu_index is not None else "any gpu")
             note = (f"{spec.gpus}x{spec.gpu_free_gb:.0f}GiB on {where}"
+                    f"{'' if spec.exclusive else ', shared'}"
                     if spec.manages_gpu else "no gpu needed")
             out.append(f"  {path.name:<24} {len(plan.tasks)} tasks   {st.dim(note)}")
         except ConfigError as exc:

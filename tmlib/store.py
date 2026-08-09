@@ -5,6 +5,7 @@
 
     ~/.tm/
       lock                          flock 互斥，防止两个终端各跑一个 tm
+      paused                        在 = 不扫队列（tm hold / tm resume）
       queue/
         010_ccfm_c.yaml             在这儿 = 还没开始。手动 cp 进来和 `tm add` 等价
         020_ccfm_d.yaml
@@ -92,6 +93,19 @@ class Run:
     @property
     def cwd(self) -> str:
         return str(self._doc.get("cwd") or "")
+
+    @property
+    def gpu_budget_gb(self) -> float:
+        """这个 run 声明要吃多少显存（每张卡）。共享同一张卡时，别人照着这个数扣账。"""
+        try:
+            return float(self._doc.get("gpu_budget_gb") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @property
+    def exclusive(self) -> bool:
+        # 缺这个键的是老 run（改 exclusive 之前跑的），按独占算才不会把它挤掉
+        return bool(self._doc.get("exclusive", True))
 
     @property
     def started(self) -> str:
@@ -243,6 +257,16 @@ class Store:
                 pass
             fh.close()          # 关闭即释放 flock
 
+    # ---- 暂停 -------------------------------------------------------------
+    # 这个文件在，tm 就不再从队列里起新的（在跑的不受影响）。用来给你腾出一段
+    # 静止时间去重排 / 删改队列，不用担心改到一半有东西被捡走跑了。
+    @property
+    def pause_flag(self) -> Path:
+        return self.root / "paused"
+
+    def paused(self) -> bool:
+        return self.pause_flag.exists()
+
     # ---- 队列 -------------------------------------------------------------
     def queued(self) -> list[Path]:
         """待跑的 list，按文件名排序 —— 这个顺序就是优先级。"""
@@ -263,7 +287,13 @@ class Store:
         while dst.exists():                 # 同名就往后挪，不覆盖
             n += 1
             dst = self.queue_dir / f"{n:03d}_{list_name(src)}{src.suffix}"
-        shutil.copy2(src, dst)
+        # 先写成 .tmp 再 rename：copy 是有中间态的，tm 的 tick 可能正好读到写了一半的
+        # yaml。截断处如果落在 task 边界上，它还是合法 yaml，只是少了几步——那就会
+        # 悄悄跑一个残缺的 list。rename 是原子的，队列里要么没有要么是完整的。
+        # queued() 按后缀过滤，所以 .tmp 期间它是隐形的。
+        tmp = dst.with_suffix(dst.suffix + ".tmp")
+        shutil.copy2(src, tmp)
+        os.replace(tmp, dst)
         return dst
 
     # ---- run 目录 ---------------------------------------------------------
@@ -294,6 +324,8 @@ class Store:
             state="running",
             cwd=str(plan.cwd),
             gpus=list(gpus),
+            gpu_budget_gb=plan.wait.gpu_free_gb or 0,
+            exclusive=plan.wait.exclusive,
             started=_now(),
             finished="",
             tasks=[TaskRecord(name=t.name, cmd=resolve(t.cmd, gpu_value)).to_dict()

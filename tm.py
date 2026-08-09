@@ -13,6 +13,7 @@
     tm check list.yaml    只解析不跑，看看展开成什么样
     tm attach [name]      attach 到正在跑的那个 task
     tm clean              清掉失败留下的 tmux 会话
+    tm hold / tm resume   暂停 / 恢复扫队列（改队列时用）
 
 设计上刻意不做的事：不自动重试、不自动 kill 卡住的任务、不做资源公平调度。
 调度权在你手里——队列顺序就是优先级，tm 只负责照着执行。
@@ -28,7 +29,8 @@ from datetime import datetime
 from pathlib import Path
 
 from tmlib import runner
-from tmlib.config import ConfigError, check_device_settings, load_plan, unescape_braces
+from tmlib.config import (MIB_PER_GIB, ConfigError, check_device_settings,
+                          load_plan, unescape_braces)
 from tmlib.gpu import GpuPool
 from tmlib.store import LockBusy, Store
 from tmlib.view import Style, render
@@ -69,23 +71,37 @@ def _loop(store: Store, args, st: Style) -> int:
 
     print(st.bold(f"tm: watching {store.queue_dir}"))
     idle_announced = False
+    pause_announced = False
 
     while True:
         pool.refresh()
         # 分配表每个 tick 从磁盘重建：tm 重启后不会把别人占着的卡再发一次
-        pool.rebuild([(r.name, r.gpus) for r in store.active()])
+        # 记账的 key 用 run 目录名而不是 list 名：两条 list 同名是允许的，
+        # 而共享一张卡时按名字销账会把同名的另一笔也一起抹掉
+        pool.rebuild([(r.path.name, r.gpus, int(r.gpu_budget_gb * MIB_PER_GIB), r.exclusive)
+                      for r in store.active()])
 
         for run in store.active():
             _advance(run, pool, st)
 
-        _start_pending(store, pool, st, args, waiting_since, complained)
+        paused = store.paused()
+        if paused:
+            if not pause_announced:
+                print(st.yellow("tm: 暂停中，只推进在跑的 task，不扫队列。恢复：tm resume"))
+                pause_announced = True
+        else:
+            if pause_announced:
+                print(st.green("tm: 已恢复扫描队列。"))
+                pause_announced = False
+            _start_pending(store, pool, st, args, waiting_since, complained)
 
         active, queued = store.active(), store.queued()
         if not active and not queued:
+            # 队列空 + 没有在跑的，暂停与否都没东西可等了，--once 照常退出
             if args.once:
                 print(st.green("tm: 队列空了，退出。"))
                 return 0
-            if not idle_announced:
+            if not paused and not idle_announced:
                 print(st.dim(f"tm: 队列空了，待命中。放东西进 {store.queue_dir} 就会自动开跑。"))
                 idle_announced = True
         else:
@@ -107,7 +123,7 @@ def _advance(run, pool: GpuPool, st: Style) -> None:
     if fail_i is not None:
         rec = tasks[fail_i - 1]
         run.set_state("failed", failed_step=fail_i, failed_rc=fail_rc)
-        pool.release(run.gpus)
+        pool.release(run.gpus, run.path.name)
         print(st.red(f"\n<== {run.name} FAILED at step {fail_i}/{len(tasks)} "
                      f"({rec.name}) rc={fail_rc}"))
         _print_tail(rec, run, fail_i, st)
@@ -117,7 +133,7 @@ def _advance(run, pool: GpuPool, st: Style) -> None:
 
     if done >= len(tasks):
         run.set_state("done")
-        pool.release(run.gpus)
+        pool.release(run.gpus, run.path.name)
         print(st.green(f"\n<== {run.name} done ({len(tasks)}/{len(tasks)})"))
         return
 
@@ -133,7 +149,7 @@ def _advance(run, pool: GpuPool, st: Style) -> None:
         # 无 rc 文件、会话也没了：被 kill -9 / OOM killer / 机器重启带走的。
         # 没有凭据就当失败——绝不能当成功往下跑。
         run.set_state("lost", failed_step=idx)
-        pool.release(run.gpus)
+        pool.release(run.gpus, run.path.name)
         print(st.red(f"\n<== {run.name} LOST at step {idx}/{len(tasks)} ({rec.name})"))
         print(st.dim("    会话消失且没有留下退出码——被硬杀或机器重启了"))
 
@@ -206,7 +222,9 @@ def _start_pending(store: Store, pool: GpuPool, st: Style, args,
                 continue
 
         run = store.claim(path, plan, gpus)
-        pool.allocate(gpus, plan.name)
+        pool.allocate(gpus, run.path.name,
+                      int((plan.wait.gpu_free_gb or 0) * MIB_PER_GIB),
+                      plan.wait.exclusive)
         waiting_since.pop(path, None)
         where = ",".join(f"gpu{g}" for g in gpus) or "no gpu"
         print(st.bold(f"\ntm: start {plan.name} on {where}  ({len(plan.tasks)} tasks)"))
@@ -257,7 +275,8 @@ def cmd_check(store: Store, args, st: Style) -> int:
         where = ("gpu " + ",".join(map(str, spec.gpu_index))
                  if spec.gpu_index is not None else "any gpu")
         print(st.cyan("  [wait] ") + f"{spec.gpus} x {spec.gpu_free_gb:.1f} GiB on {where}, "
-              f"stable for {spec.stable_for:.0f}s")
+              f"stable for {spec.stable_for:.0f}s, "
+              f"{'exclusive' if spec.exclusive else 'shared'}")
     else:
         print(st.cyan("  [wait] ") + "no gpu requirement — starts immediately")
     for i, t in enumerate(plan.tasks, start=1):
@@ -315,6 +334,28 @@ def cmd_clean(store: Store, args, st: Style) -> int:
     return 0
 
 
+def cmd_hold(store: Store, args, st: Style) -> int:
+    """按住队列，好让你安心重排。
+
+    只挡「起新的」，在跑的一个都不动——它们已经在自己的 tmux 里，跟调度器没关系了。
+    tm 没在跑的时候一样能按，等它起来就是暂停状态。
+    """
+    store.ensure()
+    store.pause_flag.write_text(f"held at {datetime.now():%Y-%m-%d %H:%M:%S}\n")
+    print(st.yellow("tm: 已暂停扫描队列。在跑的 task 不受影响。"))
+    print(st.dim(f"  队列目录 {store.queue_dir}    恢复：tm resume"))
+    return 0
+
+
+def cmd_resume(store: Store, args, st: Style) -> int:
+    if not store.paused():
+        print(st.dim("tm: 当前未暂停。"))
+        return 0
+    store.pause_flag.unlink(missing_ok=True)
+    print(st.green("tm: 已恢复扫描队列。"))
+    return 0
+
+
 # --------------------------------------------------------------------------- #
 # 入口
 # --------------------------------------------------------------------------- #
@@ -360,13 +401,17 @@ def main(argv: list[str] | None = None) -> int:
     clean = sub.add_parser("clean", help="清掉失败留下的 tmux 会话")
     clean.add_argument("-y", "--yes", action="store_true", help="真的执行")
 
+    sub.add_parser("hold", help="暂停：不再起新的，好让你改队列")
+    sub.add_parser("resume", help="解除暂停")
+
     args = p.parse_args(argv)
     args.vars = _parse_vars(args.var)
     st = Style()
     store = Store(args.root)
 
     handlers = {None: cmd_run, "run": cmd_run, "ls": cmd_ls, "add": cmd_add,
-                "check": cmd_check, "attach": cmd_attach, "clean": cmd_clean}
+                "check": cmd_check, "attach": cmd_attach, "clean": cmd_clean,
+                "hold": cmd_hold, "resume": cmd_resume}
     if args.cmd in (None, "run"):
         for name, default in (("poll", POLL_SECONDS), ("once", False),
                               ("no_device_check", False)):

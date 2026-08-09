@@ -48,6 +48,7 @@ class WaitSpec:
     gpu_index: list[int] | None = None   # None 表示 any
     stable_for: float = 120.0
     timeout: float | None = None         # 等这么久还没卡就放弃这个 list
+    exclusive: bool = True               # 这张卡不许再放第二个 tm run
 
     @property
     def manages_gpu(self) -> bool:
@@ -117,7 +118,7 @@ def _parse_wait(raw: object, where: str) -> WaitSpec:
     if not isinstance(raw, dict):
         raise ConfigError(f"{where}: 'wait:' must be a mapping")
 
-    known = {"gpu_free_gb", "gpus", "gpu_index", "stable_for", "timeout"}
+    known = {"gpu_free_gb", "gpus", "gpu_index", "stable_for", "timeout", "exclusive"}
     # YAML 1.1 把裸 on/off/yes/no 当布尔值，写 `on:` 会变成 True 这个键
     if True in raw or False in raw:
         raise ConfigError(f"{where}: YAML parses a bare 'on:' / 'off:' key as a boolean. "
@@ -152,6 +153,11 @@ def _parse_wait(raw: object, where: str) -> WaitSpec:
             if not check(value):
                 raise ConfigError(f"{where}: '{key}' out of range: {raw[key]!r}")
             setattr(spec, key, value)
+
+    if raw.get("exclusive") is not None:
+        if not isinstance(raw["exclusive"], bool):
+            raise ConfigError(f"{where}: 'exclusive' must be true or false")
+        spec.exclusive = raw["exclusive"]
 
     if raw.get("timeout") is not None:
         try:

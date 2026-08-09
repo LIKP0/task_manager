@@ -15,6 +15,15 @@
 「原子拿满」消灭死锁（不存在持有并等待），reserved 消灭饥饿
 （要 2 张卡的 A 不会被后面要 1 张卡的 B 一张张叼光）。
 代价是卡会空转着等 A 凑齐——这是有意换来的可预测性。
+
+「已分配」默认就是独占：卡上有 run 就不再进候选。`exclusive: false` 的 list 才允许共享一张卡，
+这时判据有两条，缺一不可：
+
+    实测的 free（挡别人的进程）  和  total - 卡上各 run 声明的额度（挡我们自己的）
+
+第二条不能省。tm 刚把 A 起上去时 A 还在 import torch，nvidia-smi 看着卡是空的，
+只看实测值 B 就会挤进来，等两边都建完显存池一起 OOM。而 A 要吃多少 tm 是知道的——
+已知的事不该靠采样去猜。
 """
 
 from __future__ import annotations
@@ -105,12 +114,25 @@ class _History:
         return all(free >= need_mib for ts, free in self.samples if ts >= now - window)
 
 
+@dataclass
+class Claim:
+    """一个 run 占着一张卡时留下的账。
+
+    owner 是 run 的目录名（唯一），不是 list 名——同名的 list 是允许的，
+    共享一张卡时按 list 名销账会连带把另一笔也抹掉。
+    budget 是这个 run 声明要吃的显存。
+    """
+    owner: str
+    budget_mib: int
+    exclusive: bool = True
+
+
 class GpuPool:
     """显存采样 + 分配表。每个 tick 调一次 refresh()，然后按队列顺序 pick()。"""
 
     def __init__(self):
         self.gpus: list[Gpu] = []
-        self.allocated: dict[int, str] = {}      # 卡号 -> 占着它的 run 名
+        self.claims: dict[int, list[Claim]] = {}   # 卡号 -> 占着它的 run
         self._history: dict[int, _History] = {}
         self._reserved: set[int] = set()
         self._now: float = 0.0
@@ -144,7 +166,7 @@ class GpuPool:
         need_mib = int(spec.gpu_free_gb * MIB_PER_GIB)
         eligible = [g for g in self.gpus
                     if (spec.gpu_index is None or g.index in spec.gpu_index)
-                    and g.index not in self.allocated]
+                    and self._can_join(g, need_mib, spec.exclusive)]
 
         ready = [g for g in eligible
                  if g.index not in self._reserved
@@ -160,14 +182,36 @@ class GpuPool:
         return None
 
     # ---- 分配表 ------------------------------------------------------------
-    def allocate(self, indices: list[int], owner: str) -> None:
-        for i in indices:
-            self.allocated[i] = owner
+    def _can_join(self, g: Gpu, need_mib: int, exclusive: bool) -> bool:
+        """这张卡容不容得下我。空卡永远容得下。"""
+        held = self.claims.get(g.index) or []
+        if not held:
+            return True
+        if exclusive or any(c.exclusive for c in held):
+            return False          # 任一方声明独占，整张卡就独占
+        # 共享：账面上剩的够不够。不看实测值——那边由 stable() 单独把关
+        booked = sum(c.budget_mib for c in held)
+        return g.total_mib - booked >= need_mib
 
-    def release(self, indices: list[int]) -> None:
+    def allocate(self, indices: list[int], owner: str,
+                 budget_mib: int = 0, exclusive: bool = True) -> None:
         for i in indices:
-            self.allocated.pop(i, None)
+            self.claims.setdefault(i, []).append(Claim(owner, budget_mib, exclusive))
 
-    def rebuild(self, owned: list[tuple[str, list[int]]]) -> None:
+    def release(self, indices: list[int], owner: str) -> None:
+        """只销 owner 自己那笔账，同卡上别人的留着。"""
+        for i in indices:
+            held = [c for c in self.claims.get(i, []) if c.owner != owner]
+            if held:
+                self.claims[i] = held
+            else:
+                self.claims.pop(i, None)
+
+    def rebuild(self, owned: list[tuple[str, list[int], int, bool]]) -> None:
         """从磁盘上还活着的 run 重建分配表。tm 重启后第一件事。"""
-        self.allocated = {i: name for name, indices in owned for i in indices}
+        self.claims = {}
+        for name, indices, budget_mib, exclusive in owned:
+            self.allocate(indices, name, budget_mib, exclusive)
+
+    def owners(self, index: int) -> list[str]:
+        return [c.owner for c in self.claims.get(index, [])]
