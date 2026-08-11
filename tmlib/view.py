@@ -147,7 +147,8 @@ def render(store: Store, st: Style) -> list[str]:
         tasks = run.tasks
         mark = {"done": st.green("ok    "), "failed": st.red("FAILED"),
                 "lost": st.red("LOST  "), "timeout": st.yellow("TIMOUT"),
-                "aborted": st.yellow("ABORT ")}.get(run.state, run.state[:6].ljust(6))
+                "aborted": st.yellow("ABORT "),
+                "broken": st.red("BROKEN")}.get(run.state, run.state[:6].ljust(6))
         line = (f"  {mark}  {run.name:<14} {done}/{len(tasks)}  "
                 f"{_elapsed(run.started, run.finished):>7}  {st.dim(run.finished[5:16])}")
         if fail_i and fail_i <= len(tasks):

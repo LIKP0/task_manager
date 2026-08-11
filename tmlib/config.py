@@ -26,6 +26,15 @@ _CUDA_ARG_RE = re.compile(r"--cuda[=\s]+(\S+)")
 # has been picked.
 DEFERRED_VARS = frozenset({"GPU"})
 
+# `{{`, `}}`, or `{NAME}`. Shared by substitute() and resolve() so the two passes
+# cannot disagree about what an escape looks like.
+_PLACEHOLDER_RE = re.compile(r"\{\{|\}\}|\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+# Longest 'wait.stable_for' that can ever be satisfied: gpu.py keeps this much
+# sample history, and stable() needs the history to span the whole window. Living
+# here rather than in gpu.py keeps the dependency pointing one way.
+MAX_STABLE_FOR = 1800.0
+
 # tmux session names cannot contain ':' or '.' (target syntax separators). This also
 # rules out spaces.
 _SAFE_NAME_RE = re.compile(r"[A-Za-z0-9_\-]+")
@@ -69,14 +78,13 @@ class Plan:
 # Variable substitution
 # --------------------------------------------------------------------------- #
 
-def substitute(cmd: str, variables: dict[str, str], where: str,
-               defer: frozenset[str] | tuple[()] = DEFERRED_VARS) -> str:
+def substitute(cmd: str, variables: dict[str, str], where: str) -> str:
     """Replace `{KEY}` with its value from vars.
 
     An undefined variable is an error rather than a silent pass-through: one typo in a
     config path otherwise costs hours. Write `{{` / `}}` for literal braces, as in
-    python f-strings or awk's `{{print $1}}`. Names in `defer` are left alone for a
-    later pass; `resolve()` calls with `defer=()` to finish the job.
+    python f-strings or awk's `{{print $1}}`. Names in DEFERRED_VARS are left alone
+    and expanded by resolve() once a GPU is assigned.
     """
     missing: list[str] = []
 
@@ -84,14 +92,14 @@ def substitute(cmd: str, variables: dict[str, str], where: str,
         if m.group(0) in ("{{", "}}"):
             return m.group(0)
         key = m.group(1)
-        if key in defer:
+        if key in DEFERRED_VARS:
             return m.group(0)
         if key not in variables:
             missing.append(key)
             return m.group(0)
         return variables[key]
 
-    out = re.sub(r"\{\{|\}\}|\{([A-Za-z_][A-Za-z0-9_]*)\}", repl, cmd)
+    out = _PLACEHOLDER_RE.sub(repl, cmd)
     if missing:
         raise ConfigError(
             f"{where}: undefined variable(s) {sorted(set(missing))}. "
@@ -109,11 +117,22 @@ def unescape_braces(cmd: str) -> str:
 def resolve(cmd: str, deferred: dict[str, str]) -> str:
     """Expand the deferred placeholders, then unescape braces. Last step before tmux.
 
-    Goes through `substitute()` rather than str.replace: `{GPU}` is a substring of the
-    escaped `{{GPU}}`, so a raw replace would turn a documented literal brace into an
-    expansion. The regex knows the difference.
+    Uses the shared regex rather than str.replace, because `{GPU}` is a substring of
+    the escaped `{{GPU}}` and a raw replace would turn a documented literal brace into
+    an expansion.
+
+    Anything else that looks like a placeholder is left exactly as it is. By this
+    point substitute() has already rejected undefined `{KEY}`s in the task list; what
+    survives came out of a *var value* (`FMT: "epoch{Epoch}"`), which the shell is
+    meant to receive verbatim. Raising here would kill the scheduler mid-claim, after
+    the list has been moved out of the queue.
     """
-    return unescape_braces(substitute(cmd, deferred, "resolve", defer=()))
+    def repl(m: re.Match[str]) -> str:
+        if m.group(0) in ("{{", "}}"):
+            return m.group(0)
+        return deferred.get(m.group(1), m.group(0))
+
+    return unescape_braces(_PLACEHOLDER_RE.sub(repl, cmd))
 
 
 # --------------------------------------------------------------------------- #
@@ -145,17 +164,20 @@ def _parse_wait(raw: object, where: str) -> WaitSpec:
 
     # One table for every numeric key, so a new one cannot pick up a different style
     # of validation by accident.
-    for key, cast, ok, unit in (("gpu_free_gb", float, lambda v: v > 0,  " (GiB)"),
-                                ("gpus",        int,   lambda v: v >= 1, ""),
-                                ("stable_for",  float, lambda v: v >= 0, " (seconds)"),
-                                ("timeout",     float, lambda v: v >= 0, " (seconds)")):
+    for key, cast, ok, unit, allowed in (
+            ("gpu_free_gb", float, lambda v: v > 0,  " (GiB)",     "> 0"),
+            ("gpus",        int,   lambda v: v >= 1, "",           ">= 1"),
+            ("stable_for",  float, lambda v: 0 <= v <= MAX_STABLE_FOR, " (seconds)",
+             f"0..{MAX_STABLE_FOR:.0f}"),
+            ("timeout",     float, lambda v: v >= 0, " (seconds)", ">= 0")):
         if raw.get(key) is not None:
             try:
                 value = cast(raw[key])
             except (TypeError, ValueError):
                 raise ConfigError(f"{where}: '{key}' must be a number{unit}") from None
             if not ok(value):
-                raise ConfigError(f"{where}: '{key}' out of range: {raw[key]!r}")
+                raise ConfigError(f"{where}: '{key}' out of range: {raw[key]!r} "
+                                  f"(allowed: {allowed})")
             setattr(spec, key, value)
 
     if raw.get("exclusive") is not None:
@@ -175,9 +197,18 @@ def _parse_wait(raw: object, where: str) -> WaitSpec:
         raise ConfigError(f"{where}: 'gpu_index' must be 'any', an index, "
                           f"or a list of indices")
 
-    if spec.manages_gpu and spec.gpu_index is not None and len(spec.gpu_index) < spec.gpus:
-        raise ConfigError(f"{where}: 'gpu_index' lists {len(spec.gpu_index)} gpu(s) "
-                          f"but 'gpus' is {spec.gpus}")
+    if spec.manages_gpu:
+        if spec.gpu_index is not None and len(spec.gpu_index) < spec.gpus:
+            raise ConfigError(f"{where}: 'gpu_index' lists {len(spec.gpu_index)} gpu(s) "
+                              f"but 'gpus' is {spec.gpus}")
+    elif set(raw) - {"gpu_free_gb"}:
+        # Without gpu_free_gb nothing here manages a GPU, so pick() returns
+        # immediately and every other key is silently ignored. `gpus: 2` with
+        # `gpu_index: [0]` would parse clean and then run with no GPU at all.
+        raise ConfigError(
+            f"{where}: {sorted(set(raw) - {'gpu_free_gb'})} need 'gpu_free_gb' to mean "
+            f"anything — without it the list ignores GPUs and starts immediately.\n"
+            f"      Add 'gpu_free_gb:', or drop the 'wait:' block entirely.")
 
     return spec
 
@@ -301,8 +332,9 @@ def check_device_settings(tasks: list[Task], cwd: Path, gpus: int) -> list[str]:
     seen: set[Path] = set()
 
     for task in tasks:
-        m = _CONFIG_ARG_RE.search(task.cmd)
-        if m:
+        # finditer, not search: `train.py --config a.yaml && test.py --config b.yaml`
+        # is one step with two configs, and the second one needs checking too.
+        for m in _CONFIG_ARG_RE.finditer(task.cmd):
             raw = m.group(1).strip("'\"")
             cfg_path = (cwd / raw).resolve() if not os.path.isabs(raw) else Path(raw)
             if cfg_path not in seen and cfg_path.is_file():

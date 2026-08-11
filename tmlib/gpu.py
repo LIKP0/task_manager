@@ -38,13 +38,16 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
-from .config import ConfigError, WaitSpec
+from .config import MAX_STABLE_FOR, ConfigError, WaitSpec
 
 # MiB is nvidia-smi's unit, so the conversion lives here. Callers speak GiB only.
 MIB_PER_GIB = 1024
 
-# How long to keep VRAM samples. Anything longer than a sane stable_for will do.
-HISTORY_SECONDS = 1800.0
+# How long to keep VRAM samples. stable() needs the history to span the whole
+# requested window, so this must exceed the largest stable_for the parser accepts —
+# otherwise that value would be silently unsatisfiable forever. The margin makes the
+# maximum reliably reachable rather than exactly borderline.
+HISTORY_SECONDS = MAX_STABLE_FOR + 60.0
 
 
 @dataclass

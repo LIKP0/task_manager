@@ -154,9 +154,12 @@ checkpoint the previous step just wrote:
 | `gpu_free_gb` | none | Require at least this much free VRAM (**GiB**; nvidia-smi's MiB / 1024). Omit to ignore GPUs entirely |
 | `gpus` | `1` | How many cards |
 | `gpu_index` | `any` | Restrict the candidates: `any` / `0` / `[0, 1]`. Must list at least `gpus` of them |
-| `stable_for` | `120` | **Seconds.** How long the condition must hold continuously |
+| `stable_for` | `120` | **Seconds**, max 1800. How long the condition must hold continuously. The cap is the sample history tm keeps; a larger window could never be satisfied, so it is rejected rather than accepted and never met |
 | `timeout` | none | **Seconds** (`7200` = two hours). Give up on this list after waiting this long, mark it `timeout` and move on. The timer lives only in tm's memory, so restarting tm restarts the count |
 | `exclusive` | `true` | No second tm run may share the card. `false` allows sharing, below |
+
+Every key except `gpu_free_gb` is rejected without it. `gpus: 2` with `gpu_index: [0]`
+and no `gpu_free_gb` used to parse clean and then run with no GPU management at all.
 
 `stable_for` is not optional padding. A job that just started is still reading data
 and has not built its memory pool, so nvidia-smi shows the card as empty; move in

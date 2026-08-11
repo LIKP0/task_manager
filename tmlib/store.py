@@ -55,7 +55,7 @@ TIME_FMT = "%Y-%m-%d %H:%M:%S"
 DEFAULT_ROOT = Path(__file__).resolve().parent.parent
 
 # Terminal run states. Once here, a run is never touched again.
-TERMINAL = {"done", "failed", "lost", "timeout", "aborted"}
+TERMINAL = {"done", "failed", "lost", "timeout", "aborted", "broken"}
 
 
 class StoreError(Exception):
@@ -384,6 +384,13 @@ class Store:
         started. You can edit it by hand at any time without touching running work.
         """
         self.ensure()
+        # Expand commands before anything is created or moved. Everything below this
+        # line changes the filesystem, so a failure here must not leave the list half
+        # out of the queue with an empty run directory behind it.
+        deferred = {"GPU": ",".join(str(g) for g in gpus)}
+        records = [TaskRecord(name=t.name, cmd=resolve(t.cmd, deferred)).to_dict()
+                   for t in plan.tasks]
+
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = self.runs_dir / f"{stamp}_{plan.name}"
         n = 1
@@ -397,8 +404,6 @@ class Store:
         # The GPUs are fixed at this moment, so commands are expanded once here and
         # run.yaml stores the exact line handed to tmux. After a restart tm just
         # follows it; list.yaml is never re-read.
-        deferred = {"GPU": ",".join(str(g) for g in gpus)}
-
         run = Run(path)
         run.save(
             name=plan.name,
@@ -409,8 +414,7 @@ class Store:
             exclusive=plan.wait.exclusive,
             started=now_stamp(),
             finished="",
-            tasks=[TaskRecord(name=t.name, cmd=resolve(t.cmd, deferred)).to_dict()
-                   for t in plan.tasks],
+            tasks=records,
         )
         run.event(f"claimed from {queue_path.name}, gpus={gpus or 'none'}")
         return run

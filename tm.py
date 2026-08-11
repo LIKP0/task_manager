@@ -138,6 +138,16 @@ def _advance(run, pool: GpuPool, st: Style) -> None:
     done, fail_i, fail_rc = run.scan()
     tasks = run.tasks
 
+    if not tasks:
+        # No run.yaml, or one with no tasks. `done >= len(tasks)` would be trivially
+        # true and report a list that never ran a single step as successful — exactly
+        # the false success the rc-file design exists to make impossible.
+        run.set_state("broken", note="run.yaml is missing or lists no tasks")
+        pool.release(run.gpus, run.path.name)
+        print(st.red(f"\n<== {run.name} BROKEN — no run.yaml, or it lists no tasks"))
+        print(st.dim(f"    {run.path}"))
+        return
+
     if fail_i is not None:
         rec = tasks[fail_i - 1]
         run.set_state("failed", failed_step=fail_i, failed_rc=fail_rc)
@@ -157,17 +167,23 @@ def _advance(run, pool: GpuPool, st: Style) -> None:
 
     idx = done + 1
     rec = tasks[idx - 1]
-    sess = runner.Session(runner.session_name(run.name, idx, rec.name), run.rc_path(idx))
 
     if not rec.started:
-        _launch(run, idx, rec, sess, st)
+        sess = runner.Session(runner.session_name(run.name, idx, rec.name),
+                              run.rc_path(idx))
+        _launch(run, idx, rec, sess, pool, st)
         return
 
+    # Ask about the session this step actually launched, recorded in run.yaml — not a
+    # freshly computed name. Two runs of the same list name produce the same computed
+    # name, so a recomputed one could report another run's live session as ours and
+    # leave this one stuck in `running` forever instead of declaring it LOST.
+    #
     # scan() has just confirmed step idx has no rc file, so only one question is
     # left: is the session alive? Check the session first, then re-check rc. The
     # wrapper writes rc before exiting, so if the task happened to finish between
     # the two reads the second one sees the rc and we do not misjudge it as LOST.
-    if not sess.alive() and run.rc(idx) is None:
+    if not runner.Session(rec.session).alive() and run.rc(idx) is None:
         # No rc file and no session: taken out by kill -9, the OOM killer or a
         # reboot. No evidence means failure; it must never continue as success.
         run.set_state("lost", failed_step=idx)
@@ -186,7 +202,7 @@ def _print_tail(rec, st: Style, lines: int = 12) -> None:
         print(st.dim("    | ") + line)
 
 
-def _launch(run, idx: int, rec, sess: runner.Session, st: Style) -> None:
+def _launch(run, idx: int, rec, sess: runner.Session, pool: GpuPool, st: Style) -> None:
     env = {"PYTHONUNBUFFERED": "1"}
     if run.gpus:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in run.gpus)
@@ -194,6 +210,10 @@ def _launch(run, idx: int, rec, sess: runner.Session, st: Style) -> None:
         sess.launch(rec.cmd, Path(run.cwd), env, run.script_path(idx))
     except (runner.TmuxError, OSError) as exc:
         run.set_state("aborted", note=str(exc))
+        # Terminal now, so release here rather than waiting for the next tick's
+        # rebuild(): otherwise the cards stay booked for the rest of this queue scan
+        # and lists below are refused a card nobody holds.
+        pool.release(run.gpus, run.path.name)
         print(st.red(f"tm: cannot launch {run.name} step {idx}: {exc}"))
         return
     run.set_task(idx, session=sess.name, started=store_now())
@@ -211,7 +231,18 @@ def _start_pending(store: Store, pool: GpuPool, st: Style, args,
     wanting two cards would never get to run.
     """
     now = time.monotonic()
-    for path in store.queued():
+    queued = store.queued()
+    # Drop bookkeeping for lists that left the queue by hand. `rm` is the documented
+    # way to cancel, and a stale entry here would otherwise hand its timeout clock to
+    # whatever lands on the same filename next.
+    # Both are the caller's objects, so mutate in place — rebinding would silently
+    # leave _loop holding the unpruned originals.
+    live = set(queued)
+    for stale in [p for p in waiting_since if p not in live]:
+        del waiting_since[stale]
+    complained &= live
+
+    for path in queued:
         try:
             plan = load_plan(path)
         except ConfigError as exc:
@@ -245,7 +276,15 @@ def _start_pending(store: Store, pool: GpuPool, st: Style, args,
                              "must use relative indices."))
                 continue
 
-        run = store.claim(path, plan, gpus)
+        try:
+            run = store.claim(path, plan, gpus)
+        except OSError as exc:
+            # Disk trouble mid-claim. Report and move on: killing the scheduler would
+            # strand every other queued list for a problem with this one.
+            if path not in complained:
+                complained.add(path)
+                print(st.red(f"tm: cannot start {plan.name}: {exc}"))
+            continue
         pool.allocate(gpus, run.path.name, plan.wait.gpu_free_gb or 0.0,
                       plan.wait.exclusive)
         waiting_since.pop(path, None)
@@ -281,6 +320,14 @@ def cmd_add(store: Store, args, st: Style) -> int:
             continue
         dst = store.add(src, seq=args.seq)
         print(f"queued  {st.cyan(dst.name)}")
+        # Sequence numbers only order files that have them. A hand-copied `zzz.yaml`
+        # contributes nothing to the numbering, so the new file can land ahead of it
+        # and quietly jump the queue — the opposite of the documented FIFO priority.
+        after = store.queued()
+        if after and after[-1] != dst:
+            print(st.yellow(f"  warning: {dst.name} did not land last in the queue "
+                            f"(after {after[-1].name})"))
+            print(st.dim("  queue order is filename order; rename to fix it"))
     if rc == 0:
         print(st.dim("(order is filename order; rename to change it, rm to cancel)"))
     return rc
