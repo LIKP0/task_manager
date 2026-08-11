@@ -210,10 +210,10 @@ def _advance(run, pool: GpuPool, st: Style) -> None:
         _launch(run, idx, rec, sess, pool, st)
         return
 
-    # Ask about the session this step actually launched, recorded in run.yaml — not a
-    # freshly computed name. Two runs of the same list name produce the same computed
-    # name, so a recomputed one could report another run's live session as ours and
-    # leave this one stuck in `running` forever instead of declaring it LOST.
+    # Ask about the session this step actually launched, as recorded in run.yaml,
+    # rather than recomputing the name. Recomputing means this check silently depends
+    # on session_name() still producing what it produced when the step started, which
+    # is a coupling with no upside: run.yaml already holds the answer.
     #
     # scan() has just confirmed step idx has no rc file, so only one question is
     # left: is the session alive? Check the session first, then re-check rc. The

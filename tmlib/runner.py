@@ -74,7 +74,7 @@ def _tmux(*args: str, check: bool = True) -> subprocess.CompletedProcess:
 
 
 def session_name(run_name: str, run_id: str, index: int, task_name: str) -> str:
-    """tm-ccfm_c-143022-02-test — what to attach to, without looking anything up.
+    """tm-ccfm_c-20260808-143022-02-test — what to attach to, without a lookup.
 
     `run_id` distinguishes two runs of the same list. Without it, a failed run's
     pinned pane blocks re-queueing that list: launch() refuses to reuse a live
