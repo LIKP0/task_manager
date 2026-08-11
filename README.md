@@ -1,87 +1,112 @@
 # tm
 
-把 task list 排进队列，等到卡就自动上机。每个 task 跑在自己的 tmux 会话里。
+Queue up task lists and start them when a GPU frees up. Every task runs in its own
+tmux session.
 
-一条命令跑完且退出码为 0 才跑下一条；哪一步失败就停在那里，pane 保留现场等你 attach。
+A task runs only if the previous one exited 0. On failure the list stops there and
+the pane is kept, so you can attach and look around.
 
-只依赖 `pyyaml` 和 `tmux`（用到 `wait.gpu_free_gb` 时还要 `nvidia-smi`）。
+Requires `pyyaml` and `tmux`, plus `nvidia-smi` if you use `wait.gpu_free_gb`.
 
 ```bash
-ln -s ~/task_manager/tm.py ~/.local/bin/tm    # 装一下，之后在哪都能用
+ln -s ~/task_manager/tm.py ~/.local/bin/tm    # install once
 
-tm add lists/ccfm_c.yaml     # 加进队列（就是 cp 一份进 queue/）
-tm                           # 起调度器（建议挂在 tmux 里）
-tm ls                        # 看进度。tm 在不在跑都能用
+tm add lists/ccfm_c.yaml     # add to the queue (a copy into queue/)
+tm                           # start the scheduler (run it inside tmux)
+tm ls                        # progress; works whether or not tm is running
 ```
 
-## 它是怎么组织的
+## How it is organised
 
-tm 自己**不持有任何权威状态**。队列是一个目录，进度是任务自己写下的退出码文件，
-全都在**仓库目录**底下（`tm.py` 挨着的地方，不是 `~/.tm`——藏在家目录的点目录里不好翻）。
-所以：
+tm holds no authoritative state. The queue is a directory, progress is the exit-code
+files the tasks write themselves, and all of it lives in the repo directory next to
+`tm.py` rather than in `~/.tm`, where it would be harder to browse. So:
 
-- tm 随时可以被杀掉重启，进度不丢
-- `tm ls` 是另一个进程，tm 没运行时照样能看
-- 你可以在 tm 没跑的时候手改队列
+- tm can be killed and restarted at any time without losing progress
+- `tm ls` is a separate process and works when tm is not running
+- you can edit the queue by hand while tm is stopped
 
 ```
-~/task_manager/               # 全部 .gitignore 掉了：运行时状态不是代码
-  lock                        单实例互斥（flock，进程一死内核自动释放）
-  queue/010_ccfm_c.yaml       在这儿 = 还没开始。手动 cp 进来等价于 tm add
+~/task_manager/
+  tm_config.yaml              tm's own settings (tracked in git)
+                              everything below is gitignored: runtime state is not code
+  lock                        single-instance mutex (flock, released on death)
+  queue/010_ccfm_c.yaml       here = not started. Copying one in == tm add
   runs/20260808_143301_ccfm_c/
-    list.yaml                 从队列移过来的原件
-    run.yaml                  tm 写的「计划」：状态、抢到的卡、每步的会话名和最终命令
-    01.sh                     真正交给 tmux 执行的包装脚本
-    01.rc                     *task 自己写的「结果」* —— 唯一的完成凭据
+    list.yaml                 the original, moved out of queue/
+    run.yaml                  tm's plan: state, cards held, session and final
+                              command for each step
+    01.sh                     the wrapper script tmux actually executes
+    01.rc                     *the exit code the task wrote* — the only evidence
     events.log
 ```
 
-核心划分是 **tm 写计划，task 写结果**。tm 死了，rc 文件照样在长；rc 文件是什么，tm 说了不算。
+The central split is **tm writes the plan, the task writes the result**. rc files
+keep appearing after tm dies, and tm has no say in what they contain.
 
-## 命令
+## Commands
 
 ```
-tm [-v KEY=VALUE] [--root DIR] <子命令>
+tm [--root DIR] <subcommand>
 ```
 
-| 子命令 | 作用 |
+| Subcommand | What it does |
 |---|---|
-| `tm` / `tm run` | 消费队列。默认常驻，队列空了就待命 |
-| `tm ls` | 看进度：在跑的、排队的、最近跑完的、每张卡的显存 |
-| `tm add F...` | 把 yaml 加进队列（先验一遍语法，坏的不放进去） |
-| `tm check F` | 只解析不跑，看看变量展开成什么样、会等什么卡 |
-| `tm attach [名字]` | attach 到正在跑的 task；有多个就列出来让你选 |
-| `tm clean [-y]` | 清掉失败留下的 tmux 会话。默认只列出来，`-y` 才真杀 |
-| `tm hold` / `tm resume` | 暂停 / 恢复**扫队列**。改队列时按住，改完松开 |
+| `tm` / `tm run` | Consume the queue. Stays resident and stands by when empty |
+| `tm ls` | Progress: running, queued, every finished run, and free VRAM per card |
+| `tm add F...` | Add yaml files to the queue (validated first; bad ones are refused) |
+| `tm check F` | Parse without running: see how variables expand and what it will wait for |
+| `tm attach [name]` | Attach to a running task; lists them if there are several |
+| `tm clean [-y]` | Remove tmux sessions left by failures. Lists them unless given `-y` |
+| `tm hold` / `tm resume` | Pause and resume **queue scanning**, so you can edit it |
 
-| 选项 | 属于 | 作用 |
+| Option | Applies to | What it does |
 |---|---|---|
-| `-v KEY=VALUE` | 全局 | 覆盖 yaml 里 `vars:` 的值，可重复。**必须写在子命令前面** |
-| `--root DIR` | 全局 | 覆盖状态目录（默认 = 仓库目录），也可以用环境变量 `TM_ROOT`。测试时用 |
-| `--poll SEC` | `run` | 轮询间隔，默认 10 秒 |
-| `--once` | `run` | 队列跑空就退出，不待命 |
-| `--no-device-check` | `run` | 跳过 `trainer.devices` 静态检查 |
-| `-n N` | `ls` | 显示最近几个跑完的，默认 5 |
-| `--seq N` | `add` | 指定排序号，默认排到最后 |
+| `--root DIR` | global | Override the state directory (default: the repo). `TM_ROOT` does the same |
+| `--once` | `run` | Exit when the queue drains instead of standing by |
+| `--seq N` | `add` | Sequence number; appended to the end by default |
 
-`tm run` 的退出码说的是**调度器**的事，不是任务的事：`0` 正常结束 ·
-`2` 已经有一个 tm 在跑 / 状态目录写不了 · `130` Ctrl-C。
-任务成败去 `tm ls` 看——`tm run --once` 即使有 list 失败了也返回 0。
+The command line carries **mode switches only, never settings**. Settings live in
+`tm_config.yaml`, and there is no way to override the contents of a task list from the
+command line either.
 
-Ctrl-C 只停调度，**已经起来的 task 不受影响**，还在各自的 tmux 里跑着。重新 `tm` 会接着推进。
+## tm's settings: `tm_config.yaml`
 
-## task list 长什么样
+| Key | Meaning |
+|---|---|
+| `poll` | Scheduler poll interval in seconds. Each tick samples VRAM, advances running runs and scans the queue |
+| `device_check` | Check `trainer.devices` in task configs before starting (see below) |
+
+**There are no defaults in the code.** Every key must be present in the file, which is
+why it is tracked in git and ships with the tool. A default living in Python would put
+the real value in two places, and reading the config would then tell you only what was
+overridden rather than what tm will do.
+
+**Read once at startup. No command-line override, no re-reading while running.** To
+change something, stop tm, edit the file, start it again. Running tasks live in their
+own tmux sessions, are not part of the scheduler, and survive the restart untouched.
+The cost is about zero, and in return the file always describes the running tm,
+instead of having to reconstruct which flags it was started with.
+
+A missing file, a missing key or a misspelled one (`pol1: 60`) is an error, never a
+silent fallback. Silence would leave you believing a setting applied when it did not.
+
+If you run with a custom `--root` or `TM_ROOT`, that directory needs its own copy.
+
+## What a task list looks like
 
 ```yaml
-wait:                    # 可选：等卡够用了再上机。不写这块就是排到就立刻开跑
-  gpu_free_gb: 50        # 等到有卡的空闲显存 >= 50 GiB
-  gpus: 1                # 要几张
+name: fused_tsample      # required; used in the run directory and session names
+
+wait:                    # optional: hold until enough GPU is free.
+  gpu_free_gb: 50        # wait for a card with >= 50 GiB free
+  gpus: 1                # how many cards
   gpu_index: any         # any | 0 | [0, 1]
-  stable_for: 120        # 条件要连续满足 120 秒才算数
+  stable_for: 120        # the condition must hold for 120 seconds
 
-cwd: ~/my_project  # 必填。所有命令的工作目录
+cwd: ~/my_project  # required; working directory for every command
 
-vars:                    # {KEY} 占位符
+vars:                    # {KEY} placeholders
   CFG: config/ccfm_2p5d_fused_gauss_tsample.yaml
 
 tasks:
@@ -91,145 +116,170 @@ tasks:
     cmd: python test.py --config {CFG} --run multiout_fused --cuda 0
 ```
 
-| 顶层键 | 说明 |
+| Top-level key | Meaning |
 |---|---|
-| `tasks` | **必填**，按顺序执行 |
-| `cwd` | **必填**。tmux pane 的起始目录，也就是命令里所有相对路径（脚本、config、输出目录）的解析基准。没有缺省值——`tm add` 会把 list 拷进 `queue/`，任何「相对 yaml 自身」的默认值都会跟着漂 |
-| `vars` | `{KEY}` 的值，`-v KEY=VALUE` 可覆盖 |
-| `name` | 这个 list 的名字，进 run 目录名和 tmux 会话名。默认取文件名（剥掉 `010_` 这种排序前缀） |
-| `wait` | 上机条件，见下 |
+| `tasks` | **Required**, executed in order |
+| `cwd` | **Required.** The pane's starting directory, and so the base for every relative path in your commands (scripts, configs, output directories). No default: `tm add` copies the list into `queue/`, so anything relative to the yaml itself would drift |
+| `name` | **Required.** Appears in `tm ls`, the run directory name and tmux session names (`tm-<name>-01-<task>`). Never derived from the filename |
+| `vars` | Values for `{KEY}`. No command-line override; fix them here before running |
+| `wait` | Start conditions, below |
 
-每个 task 是 `{name, cmd}`；只写一个字符串也认，名字自动叫 `step1`、`step2`。
-**名字只能用字母、数字、`_`、`-`** —— 它会变成 tmux 会话名的一部分，
-而 `.` 和 `:` 是 tmux target 语法的分隔符。
+`name` used to be derived from the filename, which also meant stripping the `010_`
+prefix that `tm add` adds — one implicit transform existing only to undo another,
+whose result ended up in tmux session names. Now it is what you wrote, and anything
+invalid is rejected immediately. Queue filenames carry ordering only.
 
-`{KEY}` 没定义会直接报错退出，不静默放过打错的路径。要写字面花括号就用 `{{` / `}}`
-（python 的 f-string、awk 的 `{{print $1}}`）。`{GPU}` 是特殊的：它等抢到卡之后才展开，
-拿到的是**物理卡号**，适合用来命名输出目录。
+Each task is `{name, cmd}`; a bare string works too and is named `step1`, `step2`.
+**Names may use letters, digits, `_` and `-` only**, because they become part of a
+tmux session name and `.` and `:` are tmux target separators.
 
-命令交给 bash 执行，`&&`、管道、`$(...)`、环境变量前缀都能用。
-`$(...)` 是在**这一步真正启动时**才求值的，所以能拿到上一步刚写出来的 ckpt：
+An undefined `{KEY}` is an error rather than a silent pass-through, so a typo in a
+path never costs you hours. Write `{{` / `}}` for literal braces (python f-strings,
+awk's `{{print $1}}`). `{GPU}` is special: it expands after a card is acquired, to
+the **physical index**, which makes it useful for naming output directories.
+
+Commands go to bash, so `&&`, pipes, `$(...)` and environment prefixes all work.
+`$(...)` is evaluated **when that step actually starts**, so it can pick up a
+checkpoint the previous step just wrote:
 
 ```yaml
 - name: test
   cmd: python test.py --config {CFG} --ckpt "$(ls -t {CKPT_DIR}/*.ckpt | head -1)"
 ```
 
-### 等卡
+### Waiting for a GPU
 
-| 键 | 默认 | 说明 |
+| Key | Default | Meaning |
 |---|---|---|
-| `gpu_free_gb` | 无 | 要求空闲显存 ≥ 这个数（**GiB**，`nvidia-smi` 的 MiB ÷ 1024）。不写 = 不管显卡 |
-| `gpus` | `1` | 要几张卡 |
-| `gpu_index` | `any` | 限定候选卡：`any` / `0` / `[0, 1]`。列的张数不能少于 `gpus` |
-| `stable_for` | `120` | 条件要连续满足多少秒才算数 |
-| `timeout` | 无 | 等这么久还没等到就放弃这个 list（标成 `timeout`，不挡住后面的） |
-| `exclusive` | `true` | 抢到的卡不许再放第二个 tm run。`false` 才允许共享，见下 |
+| `gpu_free_gb` | none | Require at least this much free VRAM (**GiB**; nvidia-smi's MiB / 1024). Omit to ignore GPUs entirely |
+| `gpus` | `1` | How many cards |
+| `gpu_index` | `any` | Restrict the candidates: `any` / `0` / `[0, 1]`. Must list at least `gpus` of them |
+| `stable_for` | `120` | **Seconds.** How long the condition must hold continuously |
+| `timeout` | none | **Seconds** (`7200` = two hours). Give up on this list after waiting this long, mark it `timeout` and move on. The timer lives only in tm's memory, so restarting tm restarts the count |
+| `exclusive` | `true` | No second tm run may share the card. `false` allows sharing, below |
 
-`stable_for` 不是可有可无的：别人的任务刚启动、正在读数据还没建显存池，
-`nvidia-smi` 看着卡是空的；这时候冲进去，30 秒后两边一起 OOM。
-要求条件**连续满足**两分钟能挡掉绝大部分这种窗口，代价只是多等两分钟。
+`stable_for` is not optional padding. A job that just started is still reading data
+and has not built its memory pool, so nvidia-smi shows the card as empty; move in
+then and both sides OOM thirty seconds later. Requiring the condition to hold
+**continuously** for two minutes closes almost all of that window, and the only cost
+is two minutes.
 
-别用 `on:` 当键名——YAML 1.1 会把裸的 `on`/`off`/`yes`/`no` 解析成布尔值
-（GitHub Actions 那个著名的坑）。所以「限定哪张卡」这个键叫 `gpu_index`。
+Do not use `on:` as a key. YAML 1.1 parses bare `on`/`off`/`yes`/`no` as booleans —
+the well-known GitHub Actions trap — which is why the key for choosing cards is
+called `gpu_index`.
 
-### 独占与共享
+### Exclusive and shared
 
-**默认独占**：一张卡上有 tm 的 run，这张卡就不再进候选池——后面的 list 显存再富余也看不见它。
-这跟 `gpu_free_gb` 无关，是分配表的结构保证。
+**Exclusive by default**: a card with a tm run on it leaves the candidate pool
+entirely, no matter how much VRAM is spare. This is structural, not a function of
+`gpu_free_gb`.
 
-`exclusive: false` 的 list 允许跟别人共享一张卡。这时能不能挤进去要过两关：
+A list with `exclusive: false` may share a card, and then two independent tests both
+have to pass:
 
-| 关卡 | 挡谁 | 判据 |
+| Test | Keeps out | Criterion |
 |---|---|---|
-| 实测空闲 | **别人**的进程 | `nvidia-smi` 的 free 连续 `stable_for` 秒 ≥ `gpu_free_gb` |
-| 账面额度 | **tm 自己**的 run | `卡的总显存 - Σ卡上各 run 声明的额度 ≥ gpu_free_gb` |
+| Measured free | **other people's** processes | nvidia-smi free >= `gpu_free_gb` for `stable_for` seconds |
+| Declared budget | **tm's own** runs | card total - sum of budgets declared on it >= `gpu_free_gb` |
 
-第二关不能省。tm 刚把 A 起上去时 A 还在 import torch，`nvidia-smi` 看着卡是空的，
-只看实测值 B 就会挤进来，等两边都建完显存池一起 OOM。而 A 打算吃多少 tm 是知道的
-（就是它自己声明的 `gpu_free_gb`）——**已知的事不该靠采样去猜**。
+The second is not optional. Right after tm starts A, A is still importing torch and
+nvidia-smi shows the card as empty; going by the measured value alone lets B in, and
+both OOM once their memory pools are built. How much A intends to use is something tm
+already knows — it is A's own `gpu_free_gb` — and **known facts should not be guessed
+at by sampling**.
 
-所以 `gpu_free_gb` 在共享模式下兼了两个身份：「我要求卡上剩这么多」和「我打算吃这么多」。
-按峰值填就对了。
+So in shared mode `gpu_free_gb` means two things at once: "I need this much free" and
+"I intend to use this much". Fill in your peak.
 
-配对规则取保守的那一边：**任一方声明独占，整张卡就独占**。A 写了 `exclusive: true`，
-B 就算写了 `false` 也进不来——不然 A 那句声明等于没说。
+Pairing takes the conservative side: **if either party asks for exclusive, the card is
+exclusive.** If A says `exclusive: true`, B cannot join even with `false` — otherwise
+A's declaration would mean nothing.
 
-## 调度
+## Scheduling
 
-**队列顺序就是优先级**，也就是文件名顺序。`tm add` 会自动编号（`010_`、`020_`…），
-改优先级就是改文件名，取消就是 `rm`。tm 每个 tick 重扫目录，
-所以**在线离线走的是同一条路径**，没有特权通道。
+**Queue order is priority**, which is filename order. `tm add` numbers files
+automatically (`010_`, `020_`, ...), so changing priority is renaming and cancelling
+is `rm`. tm rescans the directory every tick, so **online and offline edits take the
+same path** — there is no privileged channel.
 
-每个 tick 从队列顶往下扫一遍：
+Each tick scans from the top of the queue:
 
 ```
 reserved = set()
-for 每个待跑的 list（文件名顺序）:
-    能用的 = 稳定空闲的卡 - 已分配 - reserved
-    够  -> 一次拿满，起飞
-    不够 -> 把它够得着的空卡塞进 reserved，后面的 list 这个 tick 别想碰
+for each pending list (filename order):
+    available = stably free cards - allocated - reserved
+    enough     -> take them all at once and start
+    not enough -> put the free cards it could have used into reserved, so lists
+                  below cannot touch them this tick
 ```
 
-- **原子获取消灭死锁**：一个 list 要么全拿到（在跑，不等任何东西），要么一张不拿（在等，
-  不占任何东西）。不存在「持有并等待」，构不成环。
-- **reserved 消灭饥饿**：要 2 张卡的 A 不会被排在后面、只要 1 张的 B 一张张叼光。
-- 代价是卡会空转着等 A 凑齐。有意换来的可预测性。
+- **Atomic acquisition removes deadlock**: a list either holds everything it needs
+  (running, waiting for nothing) or holds nothing (waiting, blocking nothing). There
+  is no hold-and-wait, so there is no cycle.
+- **reserved removes starvation**: a list wanting two cards is not picked apart by a
+  later list wanting one.
+- The cost is cards idling while the bigger list assembles its set. That
+  predictability is bought on purpose.
 
-「车道」（卡 0 跑一串、卡 1 跑另一串）不是一个独立概念，它从 `gpu_index` 自己长出来：
-两个 list 都写 `gpu_index: 0` 就自动串行，写不同的卡就自动并行。
+Lanes — card 0 running one series, card 1 another — are not a separate concept; they
+fall out of `gpu_index`. Two lists with `gpu_index: 0` serialise, two with different
+indices run in parallel.
 
-一台机器上**同时只能有一个 tm 在调度**（flock）。第二个会直接报错退出，
-不会跟第一个抢卡。
+**Only one tm can schedule on a machine** (flock). A second one exits with an error
+rather than competing for cards.
 
-### 手改队列
+### Editing the queue by hand
 
-`queue/` 就是个普通目录，改优先级 = `mv` 改名，取消 = `rm`，禁用一条但先留着 =
-改成 `.yaml.off`（`queued()` 按后缀过滤，非 `.yaml`/`.yml` 的它看不见）。
-这些都是**原子**操作，tm 的 tick 要么看到改之前、要么看到改之后，没有中间态。
+`queue/` is an ordinary directory: change priority with `mv`, cancel with `rm`,
+disable but keep with a rename to `.yaml.off` (`queued()` filters by suffix, so
+anything that is not `.yaml`/`.yml` is invisible). All of these are **atomic** — a
+tick sees either the old state or the new one, never something in between.
 
-**有中间态的只有一种：原地写文件。** `cat > 010_x.yaml`、`echo >`、慢速写入的脚本，
-都会让文件短暂处于「写了一半」的状态。截断处如果正好落在 task 边界上，
-它仍然是合法 YAML，只是少了几步——tm 会拿去跑一个残缺的 list，还不报错。
-所以往队列里放东西只有两种正确姿势：
+**Only one thing has an in-between state: writing a file in place.** `cat >
+010_x.yaml`, `echo >`, or any slow-writing script leaves the file half-written for a
+moment. If the truncation lands on a task boundary the result is still valid YAML,
+just missing steps — and tm will run that truncated list without complaint. So there
+are exactly two correct ways to put something in the queue:
 
 ```bash
-tm add list.yaml                        # 内部就是先写 .tmp 再 rename
+tm add list.yaml                        # writes .tmp then renames
 cp list.yaml queue/015_x.yaml.tmp && mv queue/015_x.yaml{.tmp,}
 ```
 
-要连着改好几个文件、不希望改到一半有东西被捡走，用 `tm hold`：
+To edit several files without anything being picked up mid-edit, use `tm hold`:
 
 ```bash
-tm hold          # 从此不扫队列；在跑的 task 照常推进（它们已经拿到卡了）
-...              # 随便重排、删改
+tm hold          # stop scanning the queue; running tasks continue as normal
+...              # reorder, delete, edit
 tm resume
 ```
 
-`hold` 只按住「**扫队列起新 list**」这一件事。`tm` 在不在跑都能按，
-它就是仓库目录下 `paused` 这个文件在不在。
+`hold` blocks exactly one thing: **starting new lists from the queue**. It works
+whether or not tm is running, since it is just the presence of a `paused` file.
 
-## 怎么判断一步跑完了
+## How a step is judged finished
 
-tm 不是 task 的父进程——真正 `wait()` 到退出码的是 tmux pane 里那个 bash。
-它把退出码写进 `NN.rc`，这是唯一的跨进程通道。由此得到三态：
+tm is not the task's parent process. The bash inside the tmux pane is what actually
+`wait()`s for the exit code, and it writes that code to `NN.rc` — the only channel
+between them. That gives three states:
 
-| 会话 | rc 文件 | 判定 |
+| Session | rc file | Verdict |
 |---|---|---|
-| 在 | 无 | 还在跑 |
-| — | 有 | 结束了，退出码就是文件内容 |
-| **没** | **无** | **LOST —— 死了没来得及报告，当失败** |
+| alive | absent | still running |
+| — | present | finished; the exit code is the file contents |
+| **gone** | **absent** | **LOST — died without reporting; treated as a failure** |
 
-第四行是承重墙。少了它，一个被 `kill -9` / OOM killer / 机器重启带走的 train
-会被读成成功，然后 test 抱着半个 checkpoint 跑下去。
+That last row is what holds the design up. Without it, a train taken out by `kill -9`,
+the OOM killer or a reboot reads as success, and test runs against half a checkpoint.
 
-整个设计只保证一个方向：**可能把成功误报成失败，绝不会把失败误报成成功。**
-（写不进盘 → 无 rc → 当失败；被硬杀 → 无 rc → 当失败。
-所以 tm 开跑前会先验一遍状态目录可写，不然跑到一半才发现太亏。）
+The design guarantees one direction only: **it may report success as failure, but
+never failure as success.** Cannot write to disk -> no rc -> failure. Hard-killed ->
+no rc -> failure. That is also why tm verifies the state directory is writable before
+starting anything, rather than discovering it halfway through.
 
-### 包装脚本
+### The wrapper script
 
-每一步真正被执行的东西会落成 run 目录里的 `NN.sh`：
+What actually executes for each step is written to `NN.sh` in the run directory:
 
 ```bash
 #!/usr/bin/bash
@@ -246,38 +296,41 @@ echo $rc > .../01.rc.tmp && mv .../01.rc.tmp .../01.rc
 exec bash -i
 ```
 
-几个点值得知道：
+Points worth knowing:
 
-- **`set -o pipefail`**：POSIX 里管道的退出码只看最后一个命令，
-  `python train.py | tee log` 里 train 崩了也会得到 0。开了 pipefail 才拿得到真值。
-  如果你**故意**想忽略某一段的失败，自己写 `|| true`。
-- **`( )` 子 shell**：命令自己写了 `exit`（或者以 `exec` 收尾）的话，
-  不套子 shell 会把包装一起带走，rc 文件永远写不出来。
-- **先写 `.tmp` 再 `mv`**：rename 是原子的，rc 文件要么不存在要么内容完整。
-- **成功就自己消失，失败就钉在原地**：成功的会话自动退出不留垃圾；
-  失败的 pane 保留完整 scrollback，attach 进去是个站在 job 的 cwd 和环境里的
-  交互 shell（conda 是活的），可以就地查。
-- 想复现某一步，直接 `bash NN.sh`。
+- **`set -o pipefail`**: a POSIX pipeline's exit status is that of its last command,
+  so in `python train.py | tee log` a crashed train still yields 0. pipefail gets the
+  real value. To ignore a failure deliberately, write your own `|| true`.
+- **The `( )` subshell**: if the command calls `exit` (or ends in `exec`), running it
+  unwrapped would take the wrapper with it and the rc file would never be written.
+- **`.tmp` then `mv`**: rename is atomic, so the rc file is either absent or complete.
+- **Succeed and vanish, fail and stay pinned**: successful sessions exit and leave no
+  junk; failed panes keep their full scrollback, and attaching gives an interactive
+  shell in the job's cwd and environment (conda is live), so you can debug in place.
+- To reproduce a step, run `bash NN.sh`.
 
-tm 注入两个环境变量：`PYTHONUNBUFFERED=1`，以及抢到卡时的 `CUDA_VISIBLE_DEVICES`。
+tm injects two environment variables: `PYTHONUNBUFFERED=1`, and `CUDA_VISIBLE_DEVICES`
+when a card was acquired.
 
-## 出错的时候
+## When something fails
 
-失败那步的 pane 保留着，同时 tm 会把最后 12 行直接打出来，不用 attach 就能看到报错：
+The failing pane is kept, and tm prints its last 12 lines, so reading the error takes
+no attach:
 
 ```
 <== ccfm_c FAILED at step 2/3 (test) rc=1
-    --- tm-ccfm_c-02-test 最后 12 行 ------------------------------
+    --- last 12 lines of tm-ccfm_c-02-test ------------------------------
     | Traceback (most recent call last):
     | FileNotFoundError: no such checkpoint: ...
-    现场还在：tmux attach -t tm-ccfm_c-02-test
+    still there: tmux attach -t tm-ccfm_c-02-test
     /home/me/task_manager/runs/20260808_143301_ccfm_c
 ```
 
-后面的步骤不会跑。`tm ls` 里这个 list 显示成 `FAILED  ccfm_c  1/3`。
-查完了用 `tm clean -y` 把留下的会话清掉（在跑的一律不动）。
+Later steps do not run. `tm ls` shows the list as `FAILED  ccfm_c  1/3`. When you are
+done looking, `tm clean -y` removes the leftover sessions; running ones are never
+touched.
 
-`tm ls` 大概长这样：
+`tm ls` looks roughly like this:
 
 ```
 tm: pid 31337 since 2026-08-08 14:20:11
@@ -285,7 +338,7 @@ tm: pid 31337 since 2026-08-08 14:20:11
 RUNNING
   ccfm_c         gpu1     [2/3] test          1h04m   -> tmux attach -t tm-ccfm_c-02-test
 
-QUEUED   (顺序 = 优先级，改文件名即可调整)
+QUEUED   (order = priority; rename to change it)
   020_ddpm_fdg.yaml        2 tasks   1x50GiB on any gpu
 
 RECENT
@@ -297,44 +350,79 @@ GPUS
   gpu1:   94.9/95.6 GiB free   util   0%
 ```
 
-### 卡住只报警，不自动 kill
+### Stuck jobs are flagged, never killed
 
-pane 超过 30 分钟没有输出，`tm ls` 里标黄 `⚠ silent 42m10s`。但 tm 不会动它——
-存 checkpoint 的几十秒、epoch 之间、CPU-bound 的 eval 都会长时间安静，
-自动 kill 迟早有一天会掐死一个正在存 checkpoint 的健康任务，
-而那恰好是最不能被打断的时刻。要不要杀你自己判断。
+A pane with no output for 30 minutes is marked `⚠ silent 42m10s` in yellow. tm does
+nothing else about it: saving a checkpoint, the gap between epochs and CPU-bound eval
+are all long silences, and an automatic kill would eventually hit a healthy job while
+it was writing a checkpoint — precisely the worst moment to interrupt. Whether to kill
+it is your call.
 
-## config 的 `devices` 必须写相对编号
+## Configs must use relative device indices
 
-tm 选好卡后会设 `CUDA_VISIBLE_DEVICES=<物理卡号>`，子进程眼里就只剩 `gpus` 张卡、
-编号从 0 开始。config 再写 `trainer.devices: [1]` 会报错找不到卡，`test.py --cuda 1` 同理。
+After picking cards, tm sets `CUDA_VISIBLE_DEVICES=<physical index>`, so the child
+process sees only `gpus` cards numbered from 0. A config saying `trainer.devices: [1]`
+then fails to find its card, and so does `test.py --cuda 1`.
 
-所以 **tm 开跑前就把这件事查掉**：从每条命令里抠出 `--config <path>`，
-读那份 yaml 检查 `trainer.devices`，不对就不让它上机——而不是让你等了六小时才发现。
+So **tm checks this before starting**: it extracts `--config <path>` from each
+command, reads that yaml, and refuses to start the list if `trainer.devices` is wrong
+— rather than letting you find out six hours later.
 
 ```
-tm: ddpm_fdg config device check 不通过，跳过：
+tm: ddpm_fdg failed the config device check, skipping:
   - task 'train': /home/me/my_project/config/ddpm_fdg.yaml
       trainer.devices is [1], must be [0] (or 1) — tm assigns the physical card via CUDA_VISIBLE_DEVICES
 ```
 
-要物理卡号（写日志、命名输出目录）就用 `{GPU}`。不需要这套检查加 `--no-device-check`。
+Use `{GPU}` when you want the physical index (for logs or output directory names). If
+your configs have a different shape and the check only false-alarms, set
+`device_check: false` in `tm_config.yaml`.
 
-## 日志
+## Logs
 
-**tm 不管日志。** 每个 task 在自己的 tmux 会话里跑，输出就在那个 pane 的 scrollback 里，
-`tmux attach` 或 `tm attach` 直接看，进度条颜色一切正常。要留存档就在命令里自己
-`| tee train.log`（pipefail 已经开了，train 崩了不会被 tee 吃掉）。
+**tm does not manage logs.** Each task runs in its own tmux session, so its output is
+in that pane's scrollback: `tmux attach` or `tm attach` to read it, with progress bars
+and colour intact. To keep a copy, add `| tee train.log` to the command yourself
+(pipefail is already on, so a crashed train is not swallowed by tee).
 
-这是有意的：训练脚本本来就自己在写 log，tm 再抄一份是重复的。
+This is deliberate: training scripts already write their own logs, and a second copy
+from tm would be redundant.
 
-## 不做什么
+## What it does not do
 
-- **不自动重试。** 抢卡冲突已经用 `stable_for` 在事前挡了，事前避免比事后重试好——
-  重试的前提是你已经浪费了一次启动。而真正的 bug、config 写错、NaN，重跑一遍还是会炸。
-  supervisor 的价值不是「爬起来」，是**「不做错事」**：train 炸了别拿半个 checkpoint 去跑 test。
-- **不自动 kill 卡住的任务**（见上）。
-- **不保证 task 之间的语义正确性。** tm 只看退出码，它不知道 train 有没有写出 checkpoint、
-  test 读的是不是那个 checkpoint。这是你写 task list 时自己要保证的。
-- **不做资源公平调度。** 调度权在你手里，队列顺序就是优先级。
-- **一个 list 内部的 task 是串行的。** 并行（用于可分片的数据预处理）计划中，还没实现。
+- **No automatic retries** (see below).
+- **No automatically killing stuck tasks** (see above).
+- **No guarantee of semantic correctness between tasks.** tm reads exit codes only. It
+  does not know whether train wrote a checkpoint, or whether test read that
+  checkpoint. That is yours to get right when writing the list.
+- **No fair resource scheduling.** Scheduling is yours; queue order is priority.
+- **No runtime overrides of any kind.** There is no `-v KEY=VALUE`: values for `vars:`
+  live in the yaml, and settings live in `tm_config.yaml`, read once at startup. Edit the
+  files rather than patching things on the command line. (The `-v` that used to exist
+  was global, applying to every list in the queue, while `tm run` is a long-lived
+  process and lists are queued at arbitrary times — "the `-v` tm started with" and
+  "this list" never lined up in time.)
+
+## Roadmap
+
+Neither of these is built, and neither is urgent. They are listed so the reasoning
+does not have to be reconstructed next time.
+
+- **Automatic retries.** There are none today: a failed step stops and waits for you.
+  Contention for cards is already handled *beforehand* by `stable_for`, and avoiding
+  the problem beats retrying — a retry presupposes you already wasted one startup.
+  Genuine bugs, wrong configs and NaNs all fail again on a second run. A supervisor's
+  value is not in getting back up but in **not doing the wrong thing**: when train
+  crashes, do not run test against half a checkpoint.
+
+  If it is ever built, only *external* failures are worth retrying, so the first
+  problem is telling them apart from internal ones — say, retrying only on a
+  whitelist of exit codes, or only when the process died before producing anything,
+  with an attempt limit and backoff. An undiscriminating `max_retries: 3` (an earlier
+  version had one; it was removed) should not come back: it will faithfully run a
+  doomed config three times while holding the card.
+
+- **Parallel tasks within one list.** Execution is strictly serial today. The only
+  case that makes sense is shardable preprocessing, since train -> test -> eval is
+  inherently sequential. Doing it means settling the failure semantics (does one
+  failed shard fail the step?) and how VRAM is divided.

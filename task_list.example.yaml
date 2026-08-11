@@ -1,72 +1,82 @@
-# tm 的 task list 模板。抄一份到 lists/ 里改，别就地改这个文件。
+# Template for a tm task list. Copy it into lists/ and edit there.
 #
 #   cp task_list.example.yaml lists/myrun.yaml
-#   tm check lists/myrun.yaml     只解析不跑，看看变量展开成什么样
-#   tm add   lists/myrun.yaml     加进队列（就是 cp 一份进 queue/）
-#   tm                            起调度器，消费队列（建议挂在 tmux 里）
-#   tm ls                         看进度。tm 在不在跑都能用
+#   tm check lists/myrun.yaml     parse without running; see how variables expand
+#   tm add   lists/myrun.yaml     add to the queue (a copy into queue/)
+#   tm                            start the scheduler (run it inside tmux)
+#   tm ls                         progress; works whether or not tm is running
 #
-# 一条 task 跑完且退出码为 0 才跑下一条；哪一步失败就停在那里，
-# 后面的不跑，那个 pane 保留现场等你 attach。
+# A task runs only if the previous one exited 0. On failure the list stops there and
+# that pane is kept so you can attach to it.
 
 
 # ---------------------------------------------------------------------------
-# name: 这个 list 叫什么。缺省用文件名（会自动剥掉 010_ 这类排序前缀）。
-#       它会出现在 tm ls 和 tmux 会话名里（tm-<name>-01-<task>），
-#       所以只能用字母、数字、下划线、连字符。
+# name: required, no default, never derived from the filename.
+#
+# It appears in tm ls, in the run directory name and in tmux session names
+# (tm-<name>-01-<task>), so letters, digits, '_' and '-' only. Anything else is
+# rejected immediately.
 # ---------------------------------------------------------------------------
 name: myrun
 
 
 # ---------------------------------------------------------------------------
-# cwd: 必填，没有缺省值。
+# cwd: required, no default.
 #
-# 它是 tmux pane 的起始目录，也就是下面命令里所有相对路径的解析基准——
-# 既包括输入（去哪找 train.py、找 config），也包括输出（PL 的
-# default_root_dir: checkpoints/... 把 ckpt 写到哪）。
+# It is the tmux pane's starting directory, and therefore the base for every
+# relative path below — both inputs (where train.py and the config are) and outputs
+# (where PL's default_root_dir: checkpoints/... actually writes).
 #
-# 输入路径写错会立刻 file not found，很吵，好发现；输出路径写错是安静的，
-# 结果默默落到别处。所以这里不给缺省值，缺了直接报错。
+# A wrong input path fails loudly and immediately. A wrong output path is silent:
+# results just land somewhere else. Hence no default; omitting it is an error.
 # ---------------------------------------------------------------------------
-cwd: ~/YourProject      # 换成你的项目根目录。tm 会检查它存在，
-                        # 所以直接 tm check 这个模板会报 cwd not found，正常。
+cwd: ~/YourProject      # your project root. tm checks that it exists, so running
+                        # tm check on this template reports cwd not found. Expected.
 
 
 # ---------------------------------------------------------------------------
-# wait: 等到卡够用了再上机。
+# wait: hold until enough GPU is free.
 #
-# 整块可以不写——不写就是不管显卡，排到就立刻开跑（适合纯 CPU 的预处理）。
-# 抢到的卡整个 list 共用，train/test/eval 不会中途换卡，也不会在步骤之间
-# 被别人截胡。
+# The whole block is optional. Without it the list ignores GPUs and starts as soon
+# as it reaches the front of the queue (fine for CPU-only preprocessing).
+#
+# Cards are held for the whole list: train/test/eval never switch cards and cannot
+# be taken over between steps.
 # ---------------------------------------------------------------------------
 wait:
-  # 要多少空闲显存（GiB）。按你这个任务的峰值占用加点余量填。
+  # Free VRAM required, in GiB. Use your peak usage plus some headroom.
   gpu_free_gb: 50
 
-  # 要几张。多张是原子获取——要么一次拿满，要么一张都不拿，所以不会死锁。
+  # How many cards. Multiple cards are acquired atomically — all at once or none —
+  # so this cannot deadlock.
   gpus: 1
 
-  # 盯哪几张卡：any | 1 | [0, 1]
-  # 想让两个 list 串行跑在同一张卡上，就把它们都写成同一个卡号；
-  # 写不同的卡号就是并行。「车道」不用额外配置，从这里自己长出来。
+  # Which cards are eligible: any | 1 | [0, 1]
+  # To serialise two lists onto one card, give both the same index; different
+  # indices run them in parallel. Lanes need no extra configuration.
   gpu_index: any
 
-  # 条件要连续满足这么多秒才算数。防的是别人的任务刚启动、显存池还没建起来时
-  # 的假空闲——那时候 nvidia-smi 看着卡是空的，冲进去两边一起 OOM。
+  # How long the condition must hold continuously, in seconds. This guards against
+  # false idle: a job that just started has not built its memory pool yet, so
+  # nvidia-smi shows the card as empty and moving in makes both sides OOM.
   stable_for: 120
 
-  # 这张卡不许再放第二个 tm run。改成 false 才允许共享，
-  # 共享时 tm 会按各自声明的 gpu_free_gb 记账，不让账面超过总显存。
+  # No second tm run may share this card. Set false to allow sharing; tm then bills
+  # each run's declared gpu_free_gb against the card's total.
   exclusive: true
 
-  # 等这么久还没排上就放弃这个 list，去跑后面的。留空 = 一直等。
+  # Give up on this list after waiting this long (marked timeout) and move on.
+  # Seconds; 7200 below is two hours. Omit the line to wait forever.
+  # The timer lives only in tm's memory, so restarting tm restarts the count.
   # timeout: 7200
 
 
 # ---------------------------------------------------------------------------
-# vars: 命令里用 {KEY} 引用。改一个路径不用改三行命令。
-#       命令本身要用花括号时写 {{ }}（python f-string、awk 的 {{print $1}}）。
-#       -v KEY=VALUE 可以在命令行覆盖。
+# vars: referenced as {KEY} in commands, so changing a path touches one line.
+#       Write {{ }} for literal braces (python f-strings, awk's {{print $1}}).
+#       There is no command-line override; fix the values here before running.
+#       Referencing an undefined {KEY} is an error, so a typo in a path is never
+#       silently passed through.
 # ---------------------------------------------------------------------------
 vars:
   CFG: config/your_config.yaml
@@ -74,23 +84,26 @@ vars:
 
 
 # ---------------------------------------------------------------------------
-# tasks: 从上到下顺序执行，阻塞式——一条跑完才跑下一条。
+# tasks: executed top to bottom, one at a time, each blocking the next.
 #
-# 重要：tm 只看退出码，不验证产物。「上一步的输出是不是下一步要的输入」
-# 是这几条命令之间自己的约定，tm 不管。所以不要写那种「读 ckpt 的 epoch 数
-# 确认 train 跑完没」的守卫步骤——产物形状一变就得回来改，而退出码是免费的、
-# 跟产物形状无关的。把 train 和 test 放进同一个 list 就够了。
+# Important: tm only reads exit codes; it does not verify artifacts. Whether one
+# step's output is the next step's input is a contract between your commands. Do
+# not write guard steps that, say, read a checkpoint's epoch count to confirm
+# training finished — they break whenever the artifact changes shape, while the
+# exit code is free and shape-independent. Putting train and test in one list is
+# all you need.
 # ---------------------------------------------------------------------------
 tasks:
-  # 最简写法：直接一行命令，名字自动叫 step1 / step2 ...
+  # Shortest form: a bare command string, named step1 / step2 / ... automatically.
   # - python prepare.py
 
   - name: train
     cmd: python train.py --config {CFG}
 
-  # tm 已经把物理卡号设进 CUDA_VISIBLE_DEVICES 了，子进程眼里只有 0..gpus-1。
-  # 所以这里一律写 --cuda 0；config 里的 trainer.devices 同理要写 [0]。
-  # （写错了 tm 会在开跑前就查出来，不会等了几小时才报。）
+  # tm has already put the physical index in CUDA_VISIBLE_DEVICES, so the child
+  # process only sees 0..gpus-1. Always write --cuda 0 here, and [0] for
+  # trainer.devices in the config. (tm checks this before starting, so a mistake
+  # does not cost you a six-hour queue wait.)
   - name: test
     cmd: python test.py --config {CFG} --run {RUN} --cuda 0
 
