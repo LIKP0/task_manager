@@ -73,9 +73,14 @@ def _tmux(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     return res
 
 
-def session_name(run_name: str, index: int, task_name: str) -> str:
-    """tm-ccfm_c-02-test — tells you what to attach to without looking anything up."""
-    return f"{SESSION_PREFIX}{run_name}-{index:02d}-{task_name}"
+def session_name(run_name: str, run_id: str, index: int, task_name: str) -> str:
+    """tm-ccfm_c-143022-02-test — what to attach to, without looking anything up.
+
+    `run_id` distinguishes two runs of the same list. Without it, a failed run's
+    pinned pane blocks re-queueing that list: launch() refuses to reuse a live
+    session name, so the retry is aborted before it runs a single step.
+    """
+    return f"{SESSION_PREFIX}{run_name}-{run_id}-{index:02d}-{task_name}"
 
 
 def list_sessions() -> list[str]:

@@ -14,8 +14,8 @@
 # name: required, no default, never derived from the filename.
 #
 # It appears in tm ls, in the run directory name and in tmux session names
-# (tm-<name>-01-<task>), so letters, digits, '_' and '-' only. Anything else is
-# rejected immediately.
+# (tm-<name>-<run id>-01-<task>), so letters, digits, '_' and '-' only. Anything
+# else is rejected immediately.
 # ---------------------------------------------------------------------------
 name: myrun
 

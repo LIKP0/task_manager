@@ -73,7 +73,9 @@ def _loop(store: Store, args, st: Style) -> int:
     cfg: Settings = args.settings
     pool = GpuPool()
     waiting_since: dict[Path, float] = {}
-    complained: set[Path] = set()
+    # path -> which problem we last reported for it, so each is announced once and
+    # a *different* problem with the same file still gets through.
+    complained: dict[Path, str] = {}
 
     print(st.bold(f"tm: watching {store.queue_dir}"))
     print(st.dim(f"    poll {cfg.poll:.0f}s · device_check "
@@ -99,6 +101,10 @@ def _loop(store: Store, args, st: Style) -> int:
 
         paused = store.paused()
         if paused:
+            # Stop the wait clock. It measures elapsed wall time, but nothing is
+            # eligible to start while paused, so leaving it running would time out a
+            # list for an hour it never had a chance to use.
+            waiting_since.clear()
             if not pause_announced:
                 print(st.yellow("tm: paused. Running tasks still advance; the queue is "
                                 "not scanned. Resume with: tm resume"))
@@ -169,7 +175,7 @@ def _advance(run, pool: GpuPool, st: Style) -> None:
     rec = tasks[idx - 1]
 
     if not rec.started:
-        sess = runner.Session(runner.session_name(run.name, idx, rec.name),
+        sess = runner.Session(runner.session_name(run.name, run.run_id, idx, rec.name),
                               run.rc_path(idx))
         _launch(run, idx, rec, sess, pool, st)
         return
@@ -222,8 +228,28 @@ def _launch(run, idx: int, rec, sess: runner.Session, pool: GpuPool, st: Style) 
     print(st.dim(f"    tmux attach -t {sess.name}"))
 
 
+def _claim(store: Store, path: Path, plan, gpus: list[int], st: Style,
+           complained: dict[Path, str]):
+    """claim() with the disk failure reported once. None means it stays queued.
+
+    Every claim path goes through here: a claim touches the filesystem, and an
+    unguarded one takes the whole scheduler down with it, stranding every other
+    queued list over a problem with this one.
+    """
+    try:
+        run = store.claim(path, plan, gpus)
+    except OSError as exc:
+        if complained.get(path) != "claim":
+            complained[path] = "claim"
+            print(st.red(f"tm: cannot start {plan.name}: {exc}"))
+        return None
+    complained.pop(path, None)
+    return run
+
+
 def _start_pending(store: Store, pool: GpuPool, st: Style, args,
-                   waiting_since: dict[Path, float], complained: set[Path]) -> None:
+                   waiting_since: dict[Path, float],
+                   complained: dict[Path, str]) -> None:
     """Scan the queue in order and start whatever can start.
 
     Order is priority: a list that cannot fill its request reserves the free cards it
@@ -240,23 +266,27 @@ def _start_pending(store: Store, pool: GpuPool, st: Style, args,
     live = set(queued)
     for stale in [p for p in waiting_since if p not in live]:
         del waiting_since[stale]
-    complained &= live
+    for stale in [p for p in complained if p not in live]:
+        del complained[stale]
 
     for path in queued:
         try:
             plan = load_plan(path)
         except ConfigError as exc:
-            if path not in complained:
-                complained.add(path)
+            if complained.get(path) != "parse":
+                complained[path] = "parse"
                 print(st.red(f"tm: cannot read {path.name}, skipping: {exc}"))
             continue
-        complained.discard(path)
+        if complained.get(path) == "parse":
+            del complained[path]        # it parses now; a claim failure is separate
 
         gpus = pool.pick(plan.wait)
         if gpus is None:
             first = waiting_since.setdefault(path, now)
             if plan.wait.timeout is not None and now - first >= plan.wait.timeout:
-                run = store.claim(path, plan, [])
+                run = _claim(store, path, plan, [], st, complained)
+                if run is None:
+                    continue
                 run.set_state("timeout")
                 waiting_since.pop(path, None)
                 print(st.yellow(f"tm: {plan.name} timed out waiting for a gpu "
@@ -267,7 +297,9 @@ def _start_pending(store: Store, pool: GpuPool, st: Style, args,
             problems = check_device_settings(plan.tasks, plan.cwd, plan.wait.gpus)
             if problems:
                 # Do not let it retry forever in the queue: move it out and explain
-                run = store.claim(path, plan, [])
+                run = _claim(store, path, plan, [], st, complained)
+                if run is None:
+                    continue
                 run.set_state("aborted", note="device check failed")
                 print(st.red(f"tm: {plan.name} failed the config device check, skipping:"))
                 for msg in problems:
@@ -276,14 +308,8 @@ def _start_pending(store: Store, pool: GpuPool, st: Style, args,
                              "must use relative indices."))
                 continue
 
-        try:
-            run = store.claim(path, plan, gpus)
-        except OSError as exc:
-            # Disk trouble mid-claim. Report and move on: killing the scheduler would
-            # strand every other queued list for a problem with this one.
-            if path not in complained:
-                complained.add(path)
-                print(st.red(f"tm: cannot start {plan.name}: {exc}"))
+        run = _claim(store, path, plan, gpus, st, complained)
+        if run is None:
             continue
         pool.allocate(gpus, run.path.name, plan.wait.gpu_free_gb or 0.0,
                       plan.wait.exclusive)
@@ -324,7 +350,7 @@ def cmd_add(store: Store, args, st: Style) -> int:
         # contributes nothing to the numbering, so the new file can land ahead of it
         # and quietly jump the queue — the opposite of the documented FIFO priority.
         after = store.queued()
-        if after and after[-1] != dst:
+        if args.seq is None and after and after[-1] != dst:
             print(st.yellow(f"  warning: {dst.name} did not land last in the queue "
                             f"(after {after[-1].name})"))
             print(st.dim("  queue order is filename order; rename to fix it"))

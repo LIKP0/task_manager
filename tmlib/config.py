@@ -244,8 +244,9 @@ def load_plan(path: Path) -> Plan:
 
     if doc is None:
         raise ConfigError(f"{path}: file is empty")
-    if isinstance(doc, list):          # a bare list for the whole file is accepted too
-        doc = {"tasks": doc}
+    # A bare list of commands used to be accepted as shorthand for `tasks:`. It cannot
+    # work now that name: and cwd: are required, so the shorthand is gone rather than
+    # left to fail with a confusing "missing 'cwd:'".
     if not isinstance(doc, dict):
         raise ConfigError(f"{path}: expected a mapping with 'tasks:', got {type(doc).__name__}")
 
@@ -304,8 +305,8 @@ def load_plan(path: Path) -> Plan:
     if not doc.get("name"):
         raise ConfigError(
             f"{path}: missing 'name:' — it appears in tm ls, in the run directory name\n"
-            f"      and in tmux session names (tm-<name>-01-<task>). Letters, digits,\n"
-            f"      '_' and '-' only, e.g.  name: myrun")
+            f"      and in tmux session names (tm-<name>-<run id>-01-<task>). Letters,\n"
+            f"      digits, '_' and '-' only, e.g.  name: myrun")
     name = str(doc["name"])
     if not _SAFE_NAME_RE.fullmatch(name):
         raise ConfigError(f"{path}: list name {name!r} — use letters, digits, "

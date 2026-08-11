@@ -164,6 +164,22 @@ class Run:
         """tm's plan for this run. Written by save(), never by a task."""
         return self.path / "run.yaml"
 
+    @property
+    def run_id(self) -> str:
+        """Short tmux-safe token telling this run apart from another of the same list.
+
+        Run directories are <YYYYMMDD>_<HHMMSS>_<name>, plus `.N` when two start in
+        the same second. The time and that suffix are enough to be unique, and keep
+        session names short enough to read.
+        """
+        name = self.path.name
+        # List names cannot contain '.', so a trailing .N is claim()'s same-second
+        # disambiguator and nothing else.
+        _, dot, tail = name.rpartition(".")
+        parts = name.split("_")
+        stamp = parts[1] if len(parts) > 2 else name
+        return f"{stamp}-{tail}" if dot and tail.isdigit() else stamp
+
     def rc_path(self, index: int) -> Path:
         """Exit-code file for step `index` (1-based). The task writes it itself."""
         return self.path / f"{index:02d}.rc"
@@ -257,13 +273,18 @@ class Store:
         # ensure() has to be inside the try: if the root cannot be created, mkdir
         # raises PermissionError, and leaving it outside means the user gets a
         # traceback instead of the message below.
+        # Probe every directory tm actually writes into, not just the root. ensure()
+        # succeeds when the subdirectories already exist, so a writable root with a
+        # read-only runs/ would start cleanly and then fail on every single claim.
+        self_dir = self.root
         try:
             self.ensure()
-            probe = self.root / ".writable"
-            probe.write_text("ok")
-            probe.unlink()
+            for self_dir in (self.root, self.queue_dir, self.runs_dir):
+                probe = self_dir / ".writable"
+                probe.write_text("ok")
+                probe.unlink()
         except OSError as exc:
-            raise StoreError(f"{self.root} is not writable: {exc}") from exc
+            raise StoreError(f"{self_dir} is not writable: {exc.strerror}") from exc
 
     # ---- single-instance lock -----------------------------------------------
     @property
