@@ -82,6 +82,9 @@ def _loop(store: Store, args, st: Style) -> int:
                  f"{'on' if cfg.device_check else 'off'}  ({config_path(store.root)})"))
     idle_announced = False
     pause_announced = False
+    paused_at: float | None = None
+    # Runs whose directory tm can no longer write. Reported once, then left alone.
+    stuck: set[Path] = set()
 
     while True:
         pool.refresh()
@@ -97,26 +100,53 @@ def _loop(store: Store, args, st: Style) -> int:
                       for r in active])
 
         for run in active:
-            _advance(run, pool, st)
+            if run.path in stuck:
+                continue
+            try:
+                _advance(run, pool, st)
+            except OSError as exc:
+                # _advance writes run.yaml (set_state), so a run directory that has
+                # gone unwritable raises here. Killing the scheduler over one run
+                # would strand every other run and every queued list, so report it
+                # once and stop trying. Its cards stay booked above — tm cannot tell
+                # whether the task is still on them, and handing them out would be
+                # the one unrecoverable mistake.
+                stuck.add(run.path)
+                print(st.red(f"tm: cannot manage {run.name} any more: {exc}"))
+                print(st.dim(f"    {run.path}"))
+                print(st.dim("    its gpus stay reserved; fix the directory and "
+                             "restart tm to pick it up again"))
 
         paused = store.paused()
         if paused:
-            # Stop the wait clock. It measures elapsed wall time, but nothing is
-            # eligible to start while paused, so leaving it running would time out a
-            # list for an hour it never had a chance to use.
-            waiting_since.clear()
+            # Freeze the wait clock rather than resetting it. Nothing can start while
+            # paused, so a running clock would time out a list for an hour it never
+            # had a chance to use; but clearing it would also throw away the 59
+            # minutes it legitimately waited, and holding briefly around every
+            # `tm add` would then put `timeout` permanently out of reach.
+            if paused_at is None:
+                paused_at = time.monotonic()
             if not pause_announced:
                 print(st.yellow("tm: paused. Running tasks still advance; the queue is "
                                 "not scanned. Resume with: tm resume"))
                 pause_announced = True
         else:
+            if paused_at is not None:
+                # Push every clock forward by exactly the paused duration, so each
+                # list resumes with the elapsed time it had when the hold began.
+                held_for = time.monotonic() - paused_at
+                for p in waiting_since:
+                    waiting_since[p] += held_for
+                paused_at = None
             if pause_announced:
                 print(st.green("tm: queue scanning resumed."))
                 pause_announced = False
             _start_pending(store, pool, st, args, waiting_since, complained)
 
-        # Re-read: _advance and _start_pending both change what is active.
-        active, queued = store.active(), store.queued()
+        # Re-read: _advance and _start_pending both change what is active. Runs tm
+        # can no longer manage do not count — otherwise --once would never finish.
+        active = [r for r in store.active() if r.path not in stuck]
+        queued = store.queued()
         if not active and not queued:
             # Nothing queued and nothing running: paused or not, there is nothing
             # left to wait for, so --once exits as usual
@@ -230,11 +260,18 @@ def _launch(run, idx: int, rec, sess: runner.Session, pool: GpuPool, st: Style) 
 
 def _claim(store: Store, path: Path, plan, gpus: list[int], st: Style,
            complained: dict[Path, str]):
-    """claim() with the disk failure reported once. None means it stays queued.
+    """claim() with the disk failure reported once. None means it did not start.
 
     Every claim path goes through here: a claim touches the filesystem, and an
     unguarded one takes the whole scheduler down with it, stranding every other
     queued list over a problem with this one.
+
+    None does not guarantee the list is still queued. claim() moves the file out of
+    queue/ before writing run.yaml, so a failure after the move leaves a run
+    directory holding only list.yaml. That is deliberate — the alternative ordering
+    would leave the file queued *and* a complete run.yaml behind it, and the next
+    tick would start the same list twice. The leftover is picked up as `broken` on
+    the next tick, which is loud rather than silent.
     """
     try:
         run = store.claim(path, plan, gpus)

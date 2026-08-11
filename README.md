@@ -120,7 +120,7 @@ tasks:
 |---|---|
 | `tasks` | **Required**, executed in order |
 | `cwd` | **Required.** The pane's starting directory, and so the base for every relative path in your commands (scripts, configs, output directories). No default: `tm add` copies the list into `queue/`, so anything relative to the yaml itself would drift |
-| `name` | **Required.** Appears in `tm ls`, the run directory name and tmux session names (`tm-<name>-<run id>-01-<task>`, where the run id is the run's start time). Never derived from the filename |
+| `name` | **Required.** Appears in `tm ls`, the run directory name and tmux session names (`tm-<name>-<run id>-01-<task>`, where the run id is the run's start date and time). Never derived from the filename |
 | `vars` | Values for `{KEY}`. No command-line override; fix them here before running |
 | `wait` | Start conditions, below |
 
@@ -133,7 +133,7 @@ Each task is `{name, cmd}`; a bare string works too and is named `step1`, `step2
 **Names may use letters, digits, `_` and `-` only**, because they become part of a
 tmux session name and `.` and `:` are tmux target separators.
 
-The run id in a session name is that run's start time. It is what lets you re-queue
+The run id in a session name is that run's start date and time. It is what lets you re-queue
 a list whose previous run failed: the failed pane stays pinned, and without a run id
 the retry would collide with it and be aborted before running a step.
 
@@ -290,7 +290,7 @@ What actually executes for each step is written to `NN.sh` in the run directory:
 
 ```bash
 #!/usr/bin/bash
-# tm: tm-ccfm_c-143301-01-train
+# tm: tm-ccfm_c-20260808-143301-01-train
 set -o pipefail
 cd /home/me/my_project || exit 1
 
@@ -326,10 +326,10 @@ no attach:
 
 ```
 <== ccfm_c FAILED at step 2/3 (test) rc=1
-    --- last 12 lines of tm-ccfm_c-143301-02-test ------------------------
+    --- last 12 lines of tm-ccfm_c-20260808-143301-02-test ---------------
     | Traceback (most recent call last):
     | FileNotFoundError: no such checkpoint: ...
-    still there: tmux attach -t tm-ccfm_c-143301-02-test
+    still there: tmux attach -t tm-ccfm_c-20260808-143301-02-test
     /home/me/task_manager/runs/20260808_143301_ccfm_c
 ```
 
@@ -343,7 +343,7 @@ touched.
 tm: pid 31337 since 2026-08-08 14:20:11
 
 RUNNING
-  ccfm_c         gpu1     [2/3] test          1h04m   -> tmux attach -t tm-ccfm_c-143301-02-test
+  ccfm_c         gpu1     [2/3] test          1h04m   -> tmux attach -t tm-ccfm_c-20260808-143301-02-test
 
 QUEUED   (order = priority; rename to change it)
   020_ddpm_fdg.yaml        2 tasks   1x50GiB on any gpu

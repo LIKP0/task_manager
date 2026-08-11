@@ -169,15 +169,17 @@ class Run:
         """Short tmux-safe token telling this run apart from another of the same list.
 
         Run directories are <YYYYMMDD>_<HHMMSS>_<name>, plus `.N` when two start in
-        the same second. The time and that suffix are enough to be unique, and keep
-        session names short enough to read.
+        the same second. The date is kept, not just the time: a failed step pins its
+        pane open indefinitely, so a time-only id would collide again with a retry
+        that happens to start at the same second on a later day — which is the exact
+        abort this id exists to prevent.
         """
         name = self.path.name
         # List names cannot contain '.', so a trailing .N is claim()'s same-second
         # disambiguator and nothing else.
         _, dot, tail = name.rpartition(".")
         parts = name.split("_")
-        stamp = parts[1] if len(parts) > 2 else name
+        stamp = f"{parts[0]}-{parts[1]}" if len(parts) > 2 else name
         return f"{stamp}-{tail}" if dot and tail.isdigit() else stamp
 
     def rc_path(self, index: int) -> Path:
@@ -245,8 +247,18 @@ class Run:
             self.save(tasks=tasks)
 
     def event(self, text: str) -> None:
-        with (self.path / "events.log").open("a") as fh:
-            fh.write(f"{now_stamp()}  {text}\n")
+        """Append to the human-readable log. Never raises.
+
+        events.log is a convenience, not evidence: nothing reads it back. A failure
+        here used to propagate out of claim() and make a run that had *already* been
+        created look like one that never started, so the caller skipped booking its
+        cards and a later list could be put on the same GPU.
+        """
+        try:
+            with (self.path / "events.log").open("a") as fh:
+                fh.write(f"{now_stamp()}  {text}\n")
+        except OSError:
+            pass
 
 
 class Store:
@@ -276,15 +288,21 @@ class Store:
         # Probe every directory tm actually writes into, not just the root. ensure()
         # succeeds when the subdirectories already exist, so a writable root with a
         # read-only runs/ would start cleanly and then fail on every single claim.
-        self_dir = self.root
         try:
             self.ensure()
-            for self_dir in (self.root, self.queue_dir, self.runs_dir):
-                probe = self_dir / ".writable"
+        except OSError as exc:
+            # Not necessarily a permission problem: a stray *file* named runs/ next
+            # to tm.py raises FileExistsError here, and blaming the root for that
+            # sends you looking in the wrong place.
+            raise StoreError(f"cannot create the state directories under "
+                             f"{self.root}: {exc}") from exc
+        for d in (self.root, self.queue_dir, self.runs_dir):
+            probe = d / ".writable"
+            try:
                 probe.write_text("ok")
                 probe.unlink()
-        except OSError as exc:
-            raise StoreError(f"{self_dir} is not writable: {exc.strerror}") from exc
+            except OSError as exc:
+                raise StoreError(f"{d} is not writable: {exc}") from exc
 
     # ---- single-instance lock -----------------------------------------------
     @property
