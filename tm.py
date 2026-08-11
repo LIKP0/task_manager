@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
-# 注意：pane 只从 tm 继承 PATH，其余环境变量取自 tmux server 首次启动时的环境（实测 3.2a）。
-# 所以 python 找得对，但 conda activate 才有的 CONDA_PREFIX / LD_LIBRARY_PATH 会丢。
-"""tm —— 把 task list 排进队列，等到卡就自动上机。
+# Note: a pane inherits only PATH from tm; every other variable comes from the
+# environment the tmux server first started in (measured on 3.2a). So python resolves
+# correctly, but CONDA_PREFIX / LD_LIBRARY_PATH from `conda activate` are lost.
+"""tm — queue up task lists and start them when a GPU frees up.
 
-每个 task 跑在自己的 tmux 会话里，tm 只做三件事：按顺序扫队列、看谁能上机、
-盯着 rc 文件等结果。tm 自己不持有任何权威状态——全在 ~/.tm/ 下面，
-所以它随时可以被杀掉重启，也可以在它没运行的时候手改队列。
+Every task runs in its own tmux session. tm does three things: scan the queue in
+order, decide what can start, and watch rc files for results. It holds no
+authoritative state of its own; everything is on disk next to tm.py (queue/, runs/),
+so it can be killed and restarted at any time, and you can edit the queue by hand
+while it is not running.
 
-    tm                    消费 ~/.tm/queue/ 里的 task list（建议挂在 tmux 里）
-    tm ls                 看进度。tm 在不在跑都能用
-    tm add list.yaml      加进队列（就是 cp，你手动拷也一样）
-    tm check list.yaml    只解析不跑，看看展开成什么样
-    tm attach [name]      attach 到正在跑的那个 task
-    tm clean              清掉失败留下的 tmux 会话
-    tm hold / tm resume   暂停 / 恢复扫队列（改队列时用）
+    tm                    consume task lists from queue/ (run it inside tmux)
+    tm ls                 show progress; works whether or not tm is running
+    tm add list.yaml      add to the queue (a copy; doing it by hand is the same)
+    tm check list.yaml    parse without running, to see how it expands
+    tm attach [name]      attach to a running task
+    tm clean              remove tmux sessions left behind by failures
+    tm hold / tm resume   pause and resume queue scanning, to edit the queue
 
-设计上刻意不做的事：不自动重试、不自动 kill 卡住的任务、不做资源公平调度。
-调度权在你手里——队列顺序就是优先级，tm 只负责照着执行。
+tm's own settings live in tm_config.yaml, read once at startup. There are no
+built-in defaults and no command-line override: to change them, stop tm, edit the
+file, restart. Running tasks are unaffected.
+
+Deliberately absent: automatic retries, automatically killing stuck tasks, and fair
+resource scheduling. Scheduling is yours — queue order is priority, and tm follows it.
 """
 
 from __future__ import annotations
@@ -25,28 +32,26 @@ import argparse
 import os
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
 from tmlib import runner
-from tmlib.config import (MIB_PER_GIB, ConfigError, check_device_settings,
-                          load_plan, unescape_braces)
+from tmlib.config import (ConfigError, check_device_settings, load_plan,
+                          unescape_braces)
 from tmlib.gpu import GpuPool
-from tmlib.store import LockBusy, Store
-from tmlib.view import Style, render
-
-POLL_SECONDS = 10.0
+from tmlib.settings import Settings, config_path, load_settings
+from tmlib.store import LockBusy, Store, StoreError, now_stamp as store_now
+from tmlib.view import Style, describe_wait, render
 
 
 # --------------------------------------------------------------------------- #
-# tm run —— 主循环
+# tm run — the main loop
 # --------------------------------------------------------------------------- #
 
 def cmd_run(store: Store, args, st: Style) -> int:
     try:
         store.check_writable()
-    except RuntimeError as exc:
-        # rc 文件写不进去的话，跑成功的任务也会被判成失败，不如现在就炸
+    except StoreError as exc:
+        # If rc files cannot be written, even successful tasks read as failures
         print(st.red(f"error: {exc}"), file=sys.stderr)
         return 2
 
@@ -55,66 +60,79 @@ def cmd_run(store: Store, args, st: Style) -> int:
             return _loop(store, args, st)
     except LockBusy as exc:
         print(st.red(f"error: another tm is already running ({exc.holder})"), file=sys.stderr)
-        print(st.dim("  看它在干什么：tm ls"), file=sys.stderr)
+        print(st.dim("  see what it is doing: tm ls"), file=sys.stderr)
         return 2
     except KeyboardInterrupt:
-        print(st.yellow("\ntm: 停止调度。已经起来的 task 不受影响，还在各自的 tmux 里跑着。"))
-        print(st.dim("  tm ls 看进度；重新 tm 会接着往下推。"))
+        print(st.yellow("\ntm: scheduling stopped. Running tasks are unaffected — "
+                        "they are still going in their own tmux sessions."))
+        print(st.dim("  tm ls for progress; starting tm again picks up where this left off."))
         return 130
 
 
 def _loop(store: Store, args, st: Style) -> int:
-    runner.enable_activity_tracking()
+    cfg: Settings = args.settings
     pool = GpuPool()
     waiting_since: dict[Path, float] = {}
     complained: set[Path] = set()
 
     print(st.bold(f"tm: watching {store.queue_dir}"))
+    print(st.dim(f"    poll {cfg.poll:.0f}s · device_check "
+                 f"{'on' if cfg.device_check else 'off'}  ({config_path(store.root)})"))
     idle_announced = False
     pause_announced = False
 
     while True:
         pool.refresh()
-        # 分配表每个 tick 从磁盘重建：tm 重启后不会把别人占着的卡再发一次
-        # 记账的 key 用 run 目录名而不是 list 名：两条 list 同名是允许的，
-        # 而共享一张卡时按名字销账会把同名的另一笔也一起抹掉
-        pool.rebuild([(r.path.name, r.gpus, int(r.gpu_budget_gb * MIB_PER_GIB), r.exclusive)
-                      for r in store.active()])
+        # Read the active runs once. Each call parses every run.yaml under runs/, and
+        # runs/ is never pruned, so this is the tick's dominant cost at any real
+        # history size (~0.5s per call at 1000 runs).
+        active = store.active()
+        # The allocation table is rebuilt from disk every tick, so a restarted tm
+        # never hands out a card someone else already holds. Claims are keyed by run
+        # directory, not list name: duplicate list names are allowed, and releasing
+        # by name would wipe the other claim on a shared card.
+        pool.rebuild([(r.path.name, r.gpus, r.gpu_budget_gb, r.exclusive)
+                      for r in active])
 
-        for run in store.active():
+        for run in active:
             _advance(run, pool, st)
 
         paused = store.paused()
         if paused:
             if not pause_announced:
-                print(st.yellow("tm: 暂停中，只推进在跑的 task，不扫队列。恢复：tm resume"))
+                print(st.yellow("tm: paused. Running tasks still advance; the queue is "
+                                "not scanned. Resume with: tm resume"))
                 pause_announced = True
         else:
             if pause_announced:
-                print(st.green("tm: 已恢复扫描队列。"))
+                print(st.green("tm: queue scanning resumed."))
                 pause_announced = False
             _start_pending(store, pool, st, args, waiting_since, complained)
 
+        # Re-read: _advance and _start_pending both change what is active.
         active, queued = store.active(), store.queued()
         if not active and not queued:
-            # 队列空 + 没有在跑的，暂停与否都没东西可等了，--once 照常退出
+            # Nothing queued and nothing running: paused or not, there is nothing
+            # left to wait for, so --once exits as usual
             if args.once:
-                print(st.green("tm: 队列空了，退出。"))
+                print(st.green("tm: queue empty, exiting."))
                 return 0
             if not paused and not idle_announced:
-                print(st.dim(f"tm: 队列空了，待命中。放东西进 {store.queue_dir} 就会自动开跑。"))
+                print(st.dim(f"tm: queue empty, standing by. Drop something into "
+                             f"{store.queue_dir} and it starts automatically."))
                 idle_announced = True
         else:
             idle_announced = False
 
-        time.sleep(args.poll)
+        time.sleep(cfg.poll)
 
 
 def _advance(run, pool: GpuPool, st: Style) -> None:
-    """推进一个 run：把跑完的收掉，把下一步起起来。
+    """Advance one run: collect what finished, start what is next.
 
-    进度完全由 rc 文件决定（`run.scan()`），不看 run.yaml —— 所以上一步一旦写出
-    rc=0，这次调用就会直接把下一步起起来，中间不多隔一个 tick。
+    Progress comes entirely from rc files (`run.scan()`), never from run.yaml. So as
+    soon as the previous step writes rc=0, this call starts the next one, without
+    waiting another tick.
     """
     run.reload()
     done, fail_i, fail_rc = run.scan()
@@ -126,8 +144,8 @@ def _advance(run, pool: GpuPool, st: Style) -> None:
         pool.release(run.gpus, run.path.name)
         print(st.red(f"\n<== {run.name} FAILED at step {fail_i}/{len(tasks)} "
                      f"({rec.name}) rc={fail_rc}"))
-        _print_tail(rec, run, fail_i, st)
-        print(st.dim(f"    现场还在：tmux attach -t {rec.session}"))
+        _print_tail(rec, st)
+        print(st.dim(f"    still there: tmux attach -t {rec.session}"))
         print(st.dim(f"    {run.path}"))
         return
 
@@ -145,22 +163,25 @@ def _advance(run, pool: GpuPool, st: Style) -> None:
         _launch(run, idx, rec, sess, st)
         return
 
-    if sess.state().kind == runner.LOST:
-        # 无 rc 文件、会话也没了：被 kill -9 / OOM killer / 机器重启带走的。
-        # 没有凭据就当失败——绝不能当成功往下跑。
+    # scan() has just confirmed step idx has no rc file, so only one question is
+    # left: is the session alive? Check the session first, then re-check rc. The
+    # wrapper writes rc before exiting, so if the task happened to finish between
+    # the two reads the second one sees the rc and we do not misjudge it as LOST.
+    if not sess.alive() and run.rc(idx) is None:
+        # No rc file and no session: taken out by kill -9, the OOM killer or a
+        # reboot. No evidence means failure; it must never continue as success.
         run.set_state("lost", failed_step=idx)
         pool.release(run.gpus, run.path.name)
         print(st.red(f"\n<== {run.name} LOST at step {idx}/{len(tasks)} ({rec.name})"))
-        print(st.dim("    会话消失且没有留下退出码——被硬杀或机器重启了"))
+        print(st.dim("    session gone with no exit code — hard-killed or the machine rebooted"))
 
 
-def _print_tail(rec, run, index: int, st: Style, lines: int = 12) -> None:
-    """失败时把 pane 里最后几行摆出来，省得为了看一眼报错还得 attach。"""
-    sess = runner.Session(rec.session, run.rc_path(index))
-    tail = sess.capture(lines)
+def _print_tail(rec, st: Style, lines: int = 12) -> None:
+    """Print the last lines of the pane on failure, so reading the error needs no attach."""
+    tail = runner.Session(rec.session).capture(lines)
     if not tail:
         return
-    print(st.dim(f"    --- {rec.session} 最后 {len(tail)} 行 " + "-" * 30))
+    print(st.dim(f"    --- last {len(tail)} lines of {rec.session} " + "-" * 30))
     for line in tail:
         print(st.dim("    | ") + line)
 
@@ -175,7 +196,7 @@ def _launch(run, idx: int, rec, sess: runner.Session, st: Style) -> None:
         run.set_state("aborted", note=str(exc))
         print(st.red(f"tm: cannot launch {run.name} step {idx}: {exc}"))
         return
-    run.set_task(idx, session=sess.name, started=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    run.set_task(idx, session=sess.name, started=store_now())
     run.event(f"step {idx} {rec.name} -> {sess.name}")
     print(st.cyan(st.bold(f"\n==> {run.name} [{idx}] {rec.name}")) + st.dim(f"  {rec.cmd}"))
     print(st.dim(f"    tmux attach -t {sess.name}"))
@@ -183,19 +204,20 @@ def _launch(run, idx: int, rec, sess: runner.Session, st: Style) -> None:
 
 def _start_pending(store: Store, pool: GpuPool, st: Style, args,
                    waiting_since: dict[Path, float], complained: set[Path]) -> None:
-    """按队列顺序扫一遍，能上机的就上。
+    """Scan the queue in order and start whatever can start.
 
-    顺序就是优先级：拿不满卡的 list 会把它够得着的空卡 reserve 住，
-    排在它后面的这个 tick 别想碰——不然要两张卡的永远排不上。
+    Order is priority: a list that cannot fill its request reserves the free cards it
+    could have used, so lists below it cannot take them this tick. Otherwise a list
+    wanting two cards would never get to run.
     """
     now = time.monotonic()
     for path in store.queued():
         try:
-            plan = load_plan(path, cli_vars=args.vars)
+            plan = load_plan(path)
         except ConfigError as exc:
             if path not in complained:
                 complained.add(path)
-                print(st.red(f"tm: {path.name} 读不了，跳过：{exc}"))
+                print(st.red(f"tm: cannot read {path.name}, skipping: {exc}"))
             continue
         complained.discard(path)
 
@@ -206,24 +228,25 @@ def _start_pending(store: Store, pool: GpuPool, st: Style, args,
                 run = store.claim(path, plan, [])
                 run.set_state("timeout")
                 waiting_since.pop(path, None)
-                print(st.yellow(f"tm: {plan.name} 等卡超时（{plan.wait.timeout:.0f}s），跳过"))
+                print(st.yellow(f"tm: {plan.name} timed out waiting for a gpu "
+                                f"({plan.wait.timeout:.0f}s), skipping"))
             continue
 
-        if plan.wait.manages_gpu and not args.no_device_check:
+        if plan.wait.manages_gpu and args.settings.device_check:
             problems = check_device_settings(plan.tasks, plan.cwd, plan.wait.gpus)
             if problems:
-                # 别让它在队列里一遍遍重试——挪出去，把问题说清楚
+                # Do not let it retry forever in the queue: move it out and explain
                 run = store.claim(path, plan, [])
                 run.set_state("aborted", note="device check failed")
-                print(st.red(f"tm: {plan.name} config device check 不通过，跳过："))
+                print(st.red(f"tm: {plan.name} failed the config device check, skipping:"))
                 for msg in problems:
                     print(st.red(f"  - {msg}"))
-                print(st.dim("  tm 用 CUDA_VISIBLE_DEVICES 指卡，所以 config 里要写相对编号。"))
+                print(st.dim("  tm selects cards via CUDA_VISIBLE_DEVICES, so configs "
+                             "must use relative indices."))
                 continue
 
         run = store.claim(path, plan, gpus)
-        pool.allocate(gpus, run.path.name,
-                      int((plan.wait.gpu_free_gb or 0) * MIB_PER_GIB),
+        pool.allocate(gpus, run.path.name, plan.wait.gpu_free_gb or 0.0,
                       plan.wait.exclusive)
         waiting_since.pop(path, None)
         where = ",".join(f"gpu{g}" for g in gpus) or "no gpu"
@@ -232,11 +255,11 @@ def _start_pending(store: Store, pool: GpuPool, st: Style, args,
 
 
 # --------------------------------------------------------------------------- #
-# 其它子命令
+# Other subcommands
 # --------------------------------------------------------------------------- #
 
 def cmd_ls(store: Store, args, st: Style) -> int:
-    for line in render(store, st, recent=args.recent):
+    for line in render(store, st):
         print(line)
     return 0
 
@@ -249,9 +272,9 @@ def cmd_add(store: Store, args, st: Style) -> int:
             rc = 2
             continue
         try:
-            # 带上 -v：队列里的 yaml 是 run 的时候用当时 tm 的 -v 重新解析的，
-            # 这里不传的话，add 这一关会比现实更严，把能跑的 list 拦在门外。
-            load_plan(src, cli_vars=args.vars)  # 先验一遍，别把坏 yaml 放进队列
+            # Validate first, so bad yaml never reaches the queue. add and run see
+            # the same file under the same rules, so passing here means passing there.
+            load_plan(src)
         except ConfigError as exc:
             print(st.red(f"error: {src}: {exc}"), file=sys.stderr)
             rc = 2
@@ -259,29 +282,25 @@ def cmd_add(store: Store, args, st: Style) -> int:
         dst = store.add(src, seq=args.seq)
         print(f"queued  {st.cyan(dst.name)}")
     if rc == 0:
-        print(st.dim(f"（顺序就是文件名顺序，改名即可调整；rm 掉就是取消）"))
+        print(st.dim("(order is filename order; rename to change it, rm to cancel)"))
     return rc
 
 
 def cmd_check(store: Store, args, st: Style) -> int:
     try:
-        plan = load_plan(args.file, cli_vars=args.vars)
+        plan = load_plan(args.file)
     except ConfigError as exc:
         print(st.red(f"error: {exc}"), file=sys.stderr)
         return 2
     spec = plan.wait
     print(st.bold(f"{plan.name}: {len(plan.tasks)} tasks, cwd={plan.cwd}"))
-    if spec.manages_gpu:
-        where = ("gpu " + ",".join(map(str, spec.gpu_index))
-                 if spec.gpu_index is not None else "any gpu")
-        print(st.cyan("  [wait] ") + f"{spec.gpus} x {spec.gpu_free_gb:.1f} GiB on {where}, "
-              f"stable for {spec.stable_for:.0f}s, "
-              f"{'exclusive' if spec.exclusive else 'shared'}")
-    else:
-        print(st.cyan("  [wait] ") + "no gpu requirement — starts immediately")
+    # Same renderer `tm ls` uses, so check cannot describe a list differently from
+    # what you will see once it is queued.
+    print(st.cyan("  [wait] ") + describe_wait(spec))
     for i, t in enumerate(plan.tasks, start=1):
-        # 显示前展开 `{{` / `}}`，否则 check 给你看的和 shell 真正收到的不是一回事。
-        # `{GPU}` 留着不动——卡要等 claim 那一刻才定，这里还不知道。
+        # Unescape `{{` / `}}` before display, or check would show something other
+        # than what the shell receives. `{GPU}` is left alone: the card is only
+        # decided at claim time and is unknown here.
         print(f"  {st.cyan(f'[{i}] {t.name}')}  {unescape_braces(t.cmd)}")
     if spec.manages_gpu:
         problems = check_device_settings(plan.tasks, plan.cwd, spec.gpus)
@@ -303,127 +322,125 @@ def cmd_attach(store: Store, args, st: Style) -> int:
     if args.name:
         targets = [s for s in live if args.name in s] or [args.name]
     if not targets:
-        print(st.yellow("没有在跑的 task。"), file=sys.stderr)
+        print(st.yellow("No running tasks."), file=sys.stderr)
         return 1
     if len(targets) > 1:
-        print(st.bold("有多个，指定一个："))
+        print(st.bold("Several are running; pick one:"))
         for name in targets:
             print(f"  tm attach {name}")
         return 1
     os.execvp("tmux", ["tmux", "attach", "-t", f"={targets[0]}"])
-    return 0                                   # execvp 不会返回
+    return 0                                   # execvp does not return
 
 
 def cmd_clean(store: Store, args, st: Style) -> int:
-    """清掉失败留下的 pane。在跑的一律不动。"""
+    """Remove panes left behind by failures. Running ones are never touched."""
     keep = set()
     for run in store.active():
         keep.update(t.session for t in run.tasks if t.session)
-    victims = [s for s in runner.list_sessions() if s.startswith("tm-") and s not in keep]
+    victims = [s for s in runner.tm_sessions() if s not in keep]
     if not victims:
-        print(st.dim("没有可清理的会话。"))
+        print(st.dim("No sessions to clean up."))
         return 0
     for name in victims:
         if not args.yes:
             print(f"  would kill  {name}")
         else:
-            runner.Session(name, Path("/nonexistent")).kill()
+            runner.Session(name).kill()
             print(f"  killed  {name}")
     if not args.yes:
-        print(st.dim(f"加 -y 真的执行（{len(victims)} 个）"))
+        print(st.dim(f"add -y to actually do it ({len(victims)} session(s))"))
     return 0
 
 
 def cmd_hold(store: Store, args, st: Style) -> int:
-    """按住队列，好让你安心重排。
+    """Hold the queue so you can reorder it safely.
 
-    只挡「起新的」，在跑的一个都不动——它们已经在自己的 tmux 里，跟调度器没关系了。
-    tm 没在跑的时候一样能按，等它起来就是暂停状态。
+    This blocks only the starting of new lists. Running tasks are untouched; they are
+    already in their own tmux sessions and no longer involve the scheduler. It works
+    while tm is not running too — tm will come up paused.
     """
-    store.ensure()
-    store.pause_flag.write_text(f"held at {datetime.now():%Y-%m-%d %H:%M:%S}\n")
-    print(st.yellow("tm: 已暂停扫描队列。在跑的 task 不受影响。"))
-    print(st.dim(f"  队列目录 {store.queue_dir}    恢复：tm resume"))
+    store.pause()
+    print(st.yellow("tm: queue scanning paused. Running tasks are unaffected."))
+    print(st.dim(f"  queue directory {store.queue_dir}    resume with: tm resume"))
     return 0
 
 
 def cmd_resume(store: Store, args, st: Style) -> int:
-    if not store.paused():
-        print(st.dim("tm: 当前未暂停。"))
+    if not store.resume():
+        print(st.dim("tm: not currently paused."))
         return 0
-    store.pause_flag.unlink(missing_ok=True)
-    print(st.green("tm: 已恢复扫描队列。"))
+    print(st.green("tm: queue scanning resumed."))
     return 0
 
 
 # --------------------------------------------------------------------------- #
-# 入口
+# Entry point
 # --------------------------------------------------------------------------- #
-
-def _parse_vars(items: list[str]) -> dict[str, str]:
-    out = {}
-    for item in items:
-        if "=" not in item:
-            raise SystemExit(f"--var expects KEY=VALUE, got {item!r}")
-        key, value = item.split("=", 1)
-        out[key.strip()] = value
-    return out
-
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="tm", description=__doc__.split("\n")[0],
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="队列在 ~/.tm/queue/，顺序就是优先级。手动 cp 一个 yaml 进去等价于 tm add。")
-    p.add_argument("--root", type=Path, default=None, help="覆盖 ~/.tm")
-    p.add_argument("-v", "--var", action="append", default=[], metavar="KEY=VALUE",
-                   help="覆盖 yaml 里 vars: 的值，可重复")
+        epilog="The queue is queue/ in the repo directory and its order is the "
+               "priority; copying a yaml in by hand is the same as tm add. tm's own "
+               "settings live in tm_config.yaml and are read once at startup.")
+    p.add_argument("--root", type=Path, default=None,
+                   help="override the state directory (default: the repo); "
+                        "TM_ROOT does the same")
     sub = p.add_subparsers(dest="cmd")
 
-    run = sub.add_parser("run", help="消费队列（默认）")
-    run.add_argument("--poll", type=float, default=POLL_SECONDS, metavar="SEC")
-    run.add_argument("--once", action="store_true", help="队列跑空就退出，不待命")
-    run.add_argument("--no-device-check", action="store_true")
+    run = sub.add_parser("run", help="consume the queue (default)")
+    # Mode switches for this invocation only. Settings all live in tm_config.yaml.
+    run.add_argument("--once", action="store_true",
+                     help="exit when the queue drains instead of standing by")
 
-    ls = sub.add_parser("ls", help="看进度（tm 没在跑也能用）")
-    ls.add_argument("-n", "--recent", type=int, default=5, help="显示最近几个跑完的")
+    sub.add_parser("ls", help="show progress (works when tm is not running)")
 
-    add = sub.add_parser("add", help="把 yaml 加进队列")
+    add = sub.add_parser("add", help="add a yaml to the queue")
     add.add_argument("files", nargs="+", type=Path)
-    add.add_argument("--seq", type=int, default=None, help="指定排序号，默认排到最后")
+    add.add_argument("--seq", type=int, default=None,
+                     help="sequence number; appended to the end by default")
 
-    check = sub.add_parser("check", help="只解析不跑")
+    check = sub.add_parser("check", help="parse without running")
     check.add_argument("file", type=Path)
 
-    attach = sub.add_parser("attach", help="attach 到正在跑的 task")
+    attach = sub.add_parser("attach", help="attach to a running task")
     attach.add_argument("name", nargs="?", default=None)
 
-    clean = sub.add_parser("clean", help="清掉失败留下的 tmux 会话")
-    clean.add_argument("-y", "--yes", action="store_true", help="真的执行")
+    clean = sub.add_parser("clean", help="remove tmux sessions left by failures")
+    clean.add_argument("-y", "--yes", action="store_true", help="actually do it")
 
-    sub.add_parser("hold", help="暂停：不再起新的，好让你改队列")
-    sub.add_parser("resume", help="解除暂停")
+    sub.add_parser("hold", help="pause: start nothing new, so you can edit the queue")
+    sub.add_parser("resume", help="undo hold")
 
     args = p.parse_args(argv)
-    args.vars = _parse_vars(args.var)
     st = Style()
     store = Store(args.root)
-    # 任何一条命令都先把 queue/ runs/ 建出来。懒创建的话，一个没跑过 tm 的仓库里
-    # 根本看不到队列目录，而 README 和 tm ls 都在让你「cp 一个 yaml 进去」。
-    # 写不了不在这里报——cmd_run 的 check_writable() 会给出更准确的那句话。
+    # Every command creates queue/ and runs/ first. Creating them lazily means a repo
+    # that has never run tm has no queue directory to look at, while the README and
+    # tm ls both tell you to copy a yaml into it. Failures are not reported here;
+    # cmd_run's check_writable() gives a more accurate message.
     try:
         store.ensure()
     except OSError:
         pass
 
+    # tm_config.yaml is read once for every subcommand. A missing or malformed file
+    # fails here, so every command hits it; there is no config error that shows up
+    # only on one path ("tm ls is fine but tm run will not start").
+    try:
+        args.settings = load_settings(store.root)
+    except ConfigError as exc:
+        print(st.red(f"error: {exc}"), file=sys.stderr)
+        return 2
+
     handlers = {None: cmd_run, "run": cmd_run, "ls": cmd_ls, "add": cmd_add,
                 "check": cmd_check, "attach": cmd_attach, "clean": cmd_clean,
                 "hold": cmd_hold, "resume": cmd_resume}
-    if args.cmd in (None, "run"):
-        for name, default in (("poll", POLL_SECONDS), ("once", False),
-                              ("no_device_check", False)):
-            if not hasattr(args, name):
-                setattr(args, name, default)
+    if args.cmd is None and not hasattr(args, "once"):
+        args.once = False           # bare `tm` means `tm run`
+
     return handlers[args.cmd](store, args, st)
 
 

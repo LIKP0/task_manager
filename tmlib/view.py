@@ -1,20 +1,27 @@
-"""给人看的输出。`tm ls` 的全部内容都是现读磁盘 + tmux 拼出来的，
-所以 tm 在不在跑都能用——这正是把状态放盘上换来的。
+"""Human-facing output.
+
+Everything `tm ls` prints is assembled by reading disk and tmux on the spot, so it
+works whether or not tm is running. That is what keeping state on disk buys.
 """
 
 from __future__ import annotations
 
-import fcntl
 import sys
 from datetime import datetime
 
 from . import runner
 from .config import ConfigError, load_plan
 from .gpu import query_gpus
-from .store import Store
+from .store import TIME_FMT, Store
 
-# 静默多久开始标黄。存 checkpoint、跑 CPU 的 eval 都会安静很久，别设太短。
+# How long a pane must be silent before it is flagged. Checkpointing and CPU-bound
+# eval stay quiet for a long time, so do not set this low.
 SILENT_WARN = 30 * 60.0
+
+# Colour thresholds for the GPU table. Red once a card is too full to be useful to
+# anyone, yellow while someone is clearly computing on it.
+LOW_FREE_GIB = 5.0
+BUSY_UTIL_PCT = 50
 
 
 class Style:
@@ -47,40 +54,66 @@ def _elapsed(stamp: str, until: str = "") -> str:
     if not stamp:
         return ""
     try:
-        t0 = datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S")
-        t1 = datetime.strptime(until, "%Y-%m-%d %H:%M:%S") if until else datetime.now()
+        t0 = datetime.strptime(stamp, TIME_FMT)
+        t1 = datetime.strptime(until, TIME_FMT) if until else datetime.now()
     except ValueError:
         return ""
     return fmt_duration((t1 - t0).total_seconds())
 
 
-def render(store: Store, st: Style, recent: int = 5) -> list[str]:
-    """`tm ls` 的完整输出。"""
+def describe_wait(spec, short: bool = False) -> str:
+    """One sentence describing what a list is waiting for.
+
+    Shared by `tm ls` and `tm check`: check exists to preview what ls will show, so
+    the two must not drift. `short` is the compact form for the queue table.
+    """
+    if not spec.manages_gpu:
+        return "no gpu needed" if short else "no gpu requirement — starts immediately"
+    where = ("gpu " + ",".join(map(str, spec.gpu_index))
+             if spec.gpu_index is not None else "any gpu")
+    if short:
+        return (f"{spec.gpus}x{spec.gpu_free_gb:.0f}GiB on {where}"
+                f"{'' if spec.exclusive else ', shared'}")
+    return (f"{spec.gpus} x {spec.gpu_free_gb:.1f} GiB on {where}, "
+            f"stable for {spec.stable_for:.0f}s, "
+            f"{'exclusive' if spec.exclusive else 'shared'}")
+
+
+def describe_gpus(indices: list[int], empty: str) -> str:
+    return ",".join(f"gpu{g}" for g in indices) or empty
+
+
+def render(store: Store, st: Style) -> list[str]:
+    """The complete output of `tm ls`."""
     out: list[str] = []
     sessions = set(runner.list_sessions())
+    # One pass over runs/, partitioned here. Calling active() and runs() separately
+    # parsed every run.yaml twice, and runs/ is never pruned.
+    everything = store.runs()
+    active = [r for r in everything if not r.done]
+    finished = [r for r in everything if r.done]
 
-    holder = _lock_holder(store)
+    holder = store.lock_holder()
     line = st.bold("tm: ") + (st.green(holder) if holder else st.dim("not running"))
     if store.paused():
-        line += st.yellow("   [队列已暂停 · tm resume]")
+        line += st.yellow("   [queue paused · tm resume]")
     out.append(line)
 
-    # ---- 在跑的 ------------------------------------------------------------
-    active = store.active()
+    # ---- running ---------------------------------------------------------------
     if active:
         out.append("")
         out.append(st.bold("RUNNING"))
     for run in active:
-        done, fail_i, fail_rc = run.scan()
+        done, _, _ = run.scan()
         tasks = run.tasks
         idx = done + 1
-        gpu = ",".join(f"gpu{g}" for g in run.gpus) or "-"
+        gpu = describe_gpus(run.gpus, "-")
         step = tasks[idx - 1].name if idx <= len(tasks) else "-"
         line = (f"  {run.name:<14} {gpu:<8} [{idx}/{len(tasks)}] {step:<12} "
                 f"{_elapsed(run.started):>7}")
 
         if idx <= len(tasks) and tasks[idx - 1].session:
-            sess = runner.Session(tasks[idx - 1].session, run.rc_path(idx))
+            sess = runner.Session(tasks[idx - 1].session)
             if sess.name in sessions:
                 silent = sess.silent_for()
                 if silent is not None and silent >= SILENT_WARN:
@@ -90,26 +123,22 @@ def render(store: Store, st: Style, recent: int = 5) -> list[str]:
                 line += st.red("  session gone")
         out.append(line)
 
-    # ---- 排队的 ------------------------------------------------------------
+    # ---- queued ----------------------------------------------------------------
     queued = store.queued()
     if queued:
         out.append("")
-        out.append(st.bold("QUEUED") + st.dim("   (顺序 = 优先级，改文件名即可调整)"))
+        out.append(st.bold("QUEUED") + st.dim("   (order = priority; rename to change it)"))
     for path in queued:
         try:
             plan = load_plan(path)
-            spec = plan.wait
-            where = ("gpu " + ",".join(map(str, spec.gpu_index))
-                     if spec.gpu_index is not None else "any gpu")
-            note = (f"{spec.gpus}x{spec.gpu_free_gb:.0f}GiB on {where}"
-                    f"{'' if spec.exclusive else ', shared'}"
-                    if spec.manages_gpu else "no gpu needed")
+            note = describe_wait(plan.wait, short=True)
             out.append(f"  {path.name:<24} {len(plan.tasks)} tasks   {st.dim(note)}")
         except ConfigError as exc:
             out.append(f"  {path.name:<24} {st.red('BAD: ' + str(exc).splitlines()[0])}")
 
-    # ---- 跑完的 ------------------------------------------------------------
-    finished = [r for r in store.runs(limit=recent + len(active)) if r.done][:recent]
+    # ---- finished --------------------------------------------------------------
+    # Every finished run, newest first — no truncation. runs/ is the whole history,
+    # and a cut-off list quietly hides the run you were looking for.
     if finished:
         out.append("")
         out.append(st.bold("RECENT"))
@@ -128,13 +157,14 @@ def render(store: Store, st: Style, recent: int = 5) -> list[str]:
                 line += st.dim(f"  -> tmux attach -t {rec.session}")
         out.append(line)
 
-    # ---- 显卡 --------------------------------------------------------------
+    # ---- gpus ------------------------------------------------------------------
     try:
         gpus = query_gpus()
         out.append("")
         out.append(st.bold("GPUS"))
         for g in gpus:
-            bar = st.red if g.free_gib < 5 else (st.yellow if g.util > 50 else st.green)
+            bar = (st.red if g.free_gib < LOW_FREE_GIB else
+                   st.yellow if g.util > BUSY_UTIL_PCT else st.green)
             out.append(f"  gpu{g.index}: {bar(f'{g.free_gib:6.1f}')}/{g.total_gib:.1f} GiB free"
                        f"   util {g.util:3d}%")
     except ConfigError as exc:
@@ -143,30 +173,5 @@ def render(store: Store, st: Style, recent: int = 5) -> list[str]:
 
     if not active and not queued:
         out.append("")
-        out.append(st.dim(f"队列是空的。放个 yaml 进去：cp list.yaml {store.queue_dir}/"))
+        out.append(st.dim(f"Queue is empty. Drop a yaml in: cp list.yaml {store.queue_dir}/"))
     return out
-
-
-def _lock_holder(store: Store) -> str:
-    """谁拿着锁。空 = 没人在跑。
-
-    判据是「能不能非阻塞地抢到锁」而不是文件内容：tm 被硬杀时内核只回收 flock，
-    那行字会留在文件里，光读就会指着一个早没了的 pid 说它还在跑。
-    """
-    path = store.root / "lock"
-    try:
-        text = path.read_text().strip()
-    except OSError:
-        return ""
-    if not text:
-        return ""
-    try:
-        with path.open("a+") as fh:
-            try:
-                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                return text                    # 抢不到 = 真的有 tm 拿着
-            fcntl.flock(fh, fcntl.LOCK_UN)
-    except OSError:
-        return text                            # 连打开都不行，只能信文件内容
-    return ""                                  # 抢得到 = 上一个 tm 是被硬杀的

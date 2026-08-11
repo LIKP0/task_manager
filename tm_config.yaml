@@ -1,0 +1,28 @@
+# tm's own settings. Tracked in git: tm has no built-in defaults, so this file is the
+# whole answer to "how does tm behave", and it travels with the tool.
+#
+# Read once at startup. There is no command-line override and no re-reading while
+# running: to change something, stop tm, edit this file, start it again. Running tasks
+# live in their own tmux sessions, are not part of the scheduler, and survive the
+# restart untouched.
+#
+# This file is how tm runs. What to run belongs in a task list; see
+# task_list.example.yaml.
+
+
+# Scheduler poll interval, in seconds. Each tick samples VRAM, advances running runs
+# and scans the queue once. Lower is more responsive but calls nvidia-smi more often
+# (about 40ms a call); higher is cheaper but slower to notice a freed card.
+#
+# Not to be confused with wait.stable_for, which is how long a condition must hold.
+# That is judged from the sample history; poll only sets how dense those samples are.
+poll: 60
+
+
+# Check trainer.devices and --cuda in the task's own config before starting, to
+# confirm they use relative indices. tm selects cards via CUDA_VISIBLE_DEVICES, so a
+# child process only sees 0..gpus-1 and a config saying [1] will not find its card —
+# hours into the queue wait. Hence on by default.
+#
+# Turn it off if your configs have a different shape and the check only false-alarms.
+device_check: true

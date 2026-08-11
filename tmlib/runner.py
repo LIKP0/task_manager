@@ -1,22 +1,36 @@
-"""tmux 层：把一个 task 丢进一个 tmux 会话，然后隔着进程边界观察它。
+"""The tmux layer: put a task in a tmux session, then watch it across a process boundary.
 
-tm 不是 task 的父进程——真正 `wait()` 到退出码的是 tmux pane 里那个 bash。
-它把退出码写进一个文件，这就是唯一的跨进程通道。那段包装不是拼在命令行上的，
-而是**落成 run 目录里的 `NN.sh`**，tmux 收到的只有一句 `bash NN.sh`（见 write_script）。
+tm is not the task's parent process. The bash inside the tmux pane is what actually
+wait()s for the exit code, and it writes that code to a file. That file is the only
+channel between them. The wrapper is not spliced onto a tmux command line; it is
+written out as `NN.sh` in the run directory, and tmux is handed only `bash NN.sh`
+(see write_script).
 
-由此得到一张三态表，tm 每个 tick 查一次：
+That gives three states, checked once per tick:
 
-    会话在 + 无 rc   -> 还在跑
-    有 rc            -> 结束了，退出码就是文件内容（失败时会话还留着给你 attach）
-    会话没 + 无 rc    -> 死了但没来得及报告（被 kill -9 / OOM killer / 机器重启）
+    session alive + no rc  ->  still running
+    rc present             ->  finished; the exit code is the file contents
+                               (on failure the session stays up so you can attach)
+    session gone  + no rc  ->  died without reporting (kill -9, OOM killer, reboot)
 
-第三态是承重墙：**没有凭据就当失败**。少了它，一个被硬杀的 train
-会被读成成功，然后 test 抱着半个 checkpoint 跑下去。
+The third state is what holds the design up: no evidence means failure. Without it a
+hard-killed train reads as success and test runs against half a checkpoint.
 
-反过来「假成功」是不允许存在的，所以 rc 的取值路径要经得起推敲：
-写不进盘 -> 无 rc -> 当失败；被硬杀 -> 无 rc -> 当失败；rc 文件用 rename 落地，
-不存在读到半截。唯一能骗过它的是命令自己把失败吞掉（管道、后台化），
-所以包装脚本开了 `pipefail`——见 write_script 里的注释。
+False success must be impossible, so every path leans the same way: cannot write to
+disk -> no rc -> failure; hard-killed -> no rc -> failure. The rc file lands via
+rename, so a half-written read cannot happen. The only way to fool it is a command
+that swallows its own failure (a pipe, backgrounding), which is why the wrapper sets
+`pipefail`.
+
+The three-state decision is not made here. This module answers one question, "is the
+session alive" (`Session.alive()`). Reading the rc file belongs to `store.Run.rc()`,
+since the run directory owns it; two implementations would eventually disagree about
+something like whether an empty file counts. The two halves meet in `tm._advance`:
+
+    if not sess.alive() and run.rc(idx) is None:   -> LOST
+
+Session first, then re-check rc. The wrapper writes rc before exiting, so if the
+session is gone and there is still no rc, it really was never written.
 """
 
 from __future__ import annotations
@@ -25,20 +39,24 @@ import shlex
 import shutil
 import subprocess
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
-RUNNING = "running"
-DONE = "done"
-LOST = "lost"
-
-# 跑包装脚本的 shell。必须是 bash：`set -o pipefail` 在 dash/sh 里没有，
-# 而没有它，`train.py | tee log` 里 train 崩了也会得到 rc=0（实测）。
-# 没装 bash 就退回 sh，同时不写 pipefail——功能降级，但不会语法错误。
+# Shell that runs the wrapper script. bash is required for `set -o pipefail`, which
+# dash/sh lack; without it `train.py | tee log` reports rc=0 even when train crashes
+# (measured). If bash is missing we fall back to sh and drop pipefail: degraded, but
+# not a syntax error.
 BASH = shutil.which("bash")
 SCRIPT_SHELL = BASH or "/bin/sh"
 
-# 失败后钉住 pane 用的交互 shell。bash 会读 ~/.bashrc，attach 进去 conda 是可用的。
+# Resolved once, like BASH above. It is also the only thing separating sessions tm
+# may kill from the user's own, so it lives next to the function that builds names.
+TMUX = shutil.which("tmux")
+
+# Every session tm creates starts with this. `tm clean` uses it to find orphans.
+SESSION_PREFIX = "tm-"
+
+# Interactive shell that pins the pane open after a failure. bash reads ~/.bashrc, so
+# conda is live when you attach.
 HOLD_SHELL = "bash" if BASH else "sh"
 
 
@@ -46,14 +64,8 @@ class TmuxError(RuntimeError):
     pass
 
 
-@dataclass
-class State:
-    kind: str                 # running / done / lost
-    rc: int | None = None
-
-
 def _tmux(*args: str, check: bool = True) -> subprocess.CompletedProcess:
-    if not shutil.which("tmux"):
+    if not TMUX:
         raise TmuxError("tmux not found — tm runs every task inside a tmux session")
     res = subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=30)
     if check and res.returncode != 0:
@@ -62,55 +74,66 @@ def _tmux(*args: str, check: bool = True) -> subprocess.CompletedProcess:
 
 
 def session_name(run_name: str, index: int, task_name: str) -> str:
-    """tm-ccfm_c-02-test —— 看一眼就知道该 attach 谁，不用查任何东西。"""
-    return f"tm-{run_name}-{index:02d}-{task_name}"
+    """tm-ccfm_c-02-test — tells you what to attach to without looking anything up."""
+    return f"{SESSION_PREFIX}{run_name}-{index:02d}-{task_name}"
 
 
 def list_sessions() -> list[str]:
     res = _tmux("list-sessions", "-F", "#{session_name}", check=False)
-    if res.returncode != 0:          # 没有 server = 一个会话都没有，不是错误
+    if res.returncode != 0:          # no server = no sessions, not an error
         return []
     return [line.strip() for line in res.stdout.splitlines() if line.strip()]
 
 
-def write_script(path: Path, cmd: str, cwd: Path, rc_file: Path, label: str) -> None:
-    """把一步任务写成一个自足的 bash 脚本，这就是 tmux 真正执行的东西。
+def tm_sessions() -> list[str]:
+    """Only the sessions tm created. What `tm clean` is allowed to consider killing."""
+    return [s for s in list_sessions() if s.startswith(SESSION_PREFIX)]
 
-    落成文件而不是拼在 tmux 命令行上，买到四件事：
-      1. shell 无关——tmux 用 default-shell 执行命令串，不能假设那是 POSIX shell
-      2. 能开 `set -o pipefail`，也能安全地写多行，不用跟嵌套引号搏斗
-      3. 事后能看到当时到底跑了什么，复现失败就是 `bash NN.sh`
-      4. 跟 rc 文件、队列目录一样，状态摊在文件系统上，没有只存在于内存里的东西
+
+def write_script(path: Path, cmd: str, cwd: Path, rc_file: Path, label: str) -> None:
+    """Write one step as a self-contained script — the thing tmux actually runs.
+
+    Writing a file instead of splicing onto a tmux command line buys four things:
+      1. Shell independence. tmux executes command strings with its default-shell,
+         which cannot be assumed to be POSIX.
+      2. Room for `set -o pipefail` and multi-line code, with no nested quoting.
+      3. A record of what actually ran; reproducing a step is `bash NN.sh`.
+      4. Like the rc file and the queue directory, state lives on the filesystem
+         rather than only in memory.
     """
     rc_tmp = Path(f"{rc_file}.tmp")
     lines = [
         f"#!{SCRIPT_SHELL}",
         f"# tm: {label}",
-        "# 这就是 tm 交给 tmux 跑的全部内容。可以直接执行它来复现这一步。",
+        "# Everything tm hands to tmux. Run it directly to reproduce this step.",
     ]
     if BASH:
-        # 管道的退出码默认只看最后一个命令：`python train.py | tee log` 里
-        # train 崩了、tee 成功，$? 依然是 0，于是 tm 把失败读成成功、
-        # 抱着半个 checkpoint 往下跑 test。pipefail 把它掰回来。
+        # A pipeline's exit status is that of its last command, so in
+        # `python train.py | tee log` a crashed train with a successful tee still
+        # gives $? == 0. tm would read the failure as success and run test against
+        # half a checkpoint. pipefail corrects it.
         lines.append("set -o pipefail")
     lines += [
-        # 脚本自己 cd，所以脱离 tm 单独执行也是对的（tmux 的 -c 只管 pane 的初始 cwd）
+        # The script cds itself, so running it standalone is also correct
+        # (tmux -c only sets the pane's initial cwd).
         f"cd {shlex.quote(str(cwd))} || exit 1",
         "",
-        # 命令套在子 shell 里跑。不套的话，命令自己写了 `exit`（或者以 exec 收尾）
-        # 会把包装一起带走，rc 文件永远写不出来，tm 就把一次正常的失败
-        # 读成了「无凭据 = LOST」。子 shell 把 exit 挡在里面，$? 照样是真值。
+        # Run the command in a subshell. Without it, a command that calls `exit`
+        # (or ends in `exec`) takes the wrapper with it, the rc file is never
+        # written, and tm reads an ordinary failure as "no evidence = LOST".
+        # The subshell contains the exit; $? is still the real value.
         f"( {cmd} )",
         "rc=$?",
         "",
-        # 先写临时文件再 rename。rename 是原子的，所以 rc 文件要么不存在、
-        # 要么内容完整——「读到半截」这类问题从「已处理」变成「不可能发生」。
-        # 写不进去时 && 短路，不留下 rc 文件，tm 判 LOST（当失败），方向是安全的。
+        # Write a temp file, then rename. rename is atomic, so the rc file is either
+        # absent or complete: a torn read goes from "handled" to "impossible".
+        # If the write fails, && short-circuits and no rc file is left, so tm judges
+        # LOST (a failure) — the safe direction.
         f"echo $rc > {shlex.quote(str(rc_tmp))} && "
         f"mv {shlex.quote(str(rc_tmp))} {shlex.quote(str(rc_file))}",
         "",
-        # 成功就自己消失（不留垃圾会话），失败就钉在原地：
-        # pane 保留完整 scrollback，attach 进去是个站在 job cwd 和环境里的交互 shell。
+        # Succeed and vanish (leaving no junk sessions); fail and stay pinned with
+        # full scrollback, as an interactive shell in the job's cwd and environment.
         "[ $rc -eq 0 ] && exit 0",
         f"exec {HOLD_SHELL} -i",
         "",
@@ -120,31 +143,43 @@ def write_script(path: Path, cmd: str, cwd: Path, rc_file: Path, label: str) -> 
 
 
 class Session:
-    """一个 tmux 会话 = 一个正在跑（或已经死掉）的 task。"""
+    """One tmux session = one task, running or already dead.
 
-    def __init__(self, name: str, rc_file: Path):
+    Only answers tmux questions: is it alive, what is on screen, how long since
+    output. Whether the step finished belongs to the rc file, read by `store.Run.rc()`.
+    """
+
+    def __init__(self, name: str, rc_file: Path | None = None):
         self.name = name
-        self.rc_file = rc_file
+        self.rc_file = rc_file          # only launch() needs it (goes into the script)
 
-    # target 前面的 '=' 强制精确匹配（tmux 默认是前缀匹配，不加的话
-    # tm-x-01-a 会命中 tm-x-01-abc）。但 '=' 只有 session 级命令认，
-    # capture-pane / display-message 这类 pane 级命令给了会直接报 can't find pane，
-    # 所以分成两种写法：判定存活用精确的，抓屏幕用裸名字。
+    # A leading '=' forces an exact match; tmux matches by prefix otherwise, so
+    # tm-x-01-a would hit tm-x-01-abc. But '=' is only understood by session-level
+    # commands. Pane-level commands like capture-pane and display-message reject it,
+    # hence two spellings: exact for liveness checks, bare name for screen reads.
+    #
+    # Do not "simplify" the two pane_target uses below to target:
+    # `display-message -t '=name'` kills the entire tmux server on 3.2a (reproduces
+    # every time, whether or not the session exists), and silent_for() runs on every
+    # `tm ls` — one `tm ls` would take down every running job.
     @property
     def target(self) -> str:
         return f"={self.name}"
 
     @property
     def pane_target(self) -> str:
-        # 裸名字在会话存在时就是精确命中（tmux 先试精确再试前缀），
-        # 而这两个调用点只影响显示，不参与「跑完没有」的判定。
+        # A bare name is an exact hit when the session exists (tmux tries exact
+        # before prefix), and these two call sites only affect display; they take no
+        # part in deciding whether a step finished.
         return self.name
 
     def launch(self, cmd: str, cwd: Path, env: dict[str, str], script: Path) -> None:
-        """起会话。命令跑完会把退出码写进 rc_file。
+        """Start the session. The command writes its exit code to rc_file when done.
 
-        `script` 是包装脚本的落点（run 目录里的 `NN.sh`）。
+        `script` is where the wrapper lands (`NN.sh` in the run directory).
         """
+        if self.rc_file is None:
+            raise TmuxError(f"session {self.name}: launch() requires rc_file")
         if self.alive():
             raise TmuxError(f"session {self.name} already exists — "
                             f"kill it first: tmux kill-session -t {self.name}")
@@ -152,46 +187,25 @@ class Session:
         args = ["new-session", "-d", "-s", self.name, "-c", str(cwd)]
         for key, value in env.items():
             args += ["-e", f"{key}={value}"]
-        # 交给 tmux 的就这一句。tmux 是拿 default-shell（默认 $SHELL）来 -c 执行它的，
-        # 而 `bash <path>` 在 fish / csh / zsh 里都是合法的一条命令调用——
-        # 把包装的 shell 语法关在文件里，就不用假设用户的登录 shell 是 POSIX 的。
+        # This one line is all tmux gets. tmux runs it with default-shell (normally
+        # $SHELL), and `bash <path>` is a valid command invocation in fish, csh and
+        # zsh alike. Keeping the wrapper's shell syntax inside the file means we
+        # never have to assume the user's login shell is POSIX.
         args.append(f"{SCRIPT_SHELL} {shlex.quote(str(script))}")
         _tmux(*args)
 
     def alive(self) -> bool:
         return _tmux("has-session", "-t", self.target, check=False).returncode == 0
 
-    def state(self) -> State:
-        """三态判定。先看 rc 文件，再看会话——顺序不能反。
-
-        反过来的话会撞上一个窗口：任务刚写完 rc、会话正在消失的那一瞬间，
-        先查会话会看到「没了」，再查 rc 却是有的，得多绕一次。
-        先查 rc 则永远不会误判。
-        """
-        rc = self._read_rc()
-        if rc is not None:
-            return State(DONE, rc)
-        if self.alive():
-            return State(RUNNING)
-        return State(LOST)          # 无凭据 = 失败
-
-    def _read_rc(self) -> int | None:
-        try:
-            text = self.rc_file.read_text().strip()
-        except OSError:
-            return None
-        if not text:
-            return None             # 文件刚建、还没写进去
-        try:
-            return int(text)
-        except ValueError:
-            return 1                # 写到一半被打断，当失败
-
     def silent_for(self) -> float | None:
-        """这个 pane 多久没有输出了（秒）。拿不到就返回 None。
+        """Seconds since this pane last produced output, or None if unavailable.
 
-        用来给死锁/卡住的任务标黄——只报警，不动手。存 checkpoint、
-        跑 CPU 的 eval 都会安静很久，自动 kill 迟早误伤。
+        Used to flag stuck jobs in yellow. It only warns, never acts: checkpointing
+        and CPU-bound eval are silent for long stretches, so an automatic kill would
+        eventually hit a healthy job.
+
+        `#{window_activity}` updates without enabling `monitor-activity` (measured on
+        3.2a: on a fresh server a chatty session reads 0s and a quiet one grows).
         """
         res = _tmux("display-message", "-p", "-t", self.pane_target,
                     "#{window_activity}", check=False)
@@ -203,7 +217,7 @@ class Session:
             return None
 
     def capture(self, lines: int = 40) -> list[str]:
-        """抓当前屏幕内容，给 `tm ls` 显示失败现场的最后几行。"""
+        """Grab the current screen, to show the last lines of a failure in place."""
         res = _tmux("capture-pane", "-p", "-t", self.pane_target, check=False)
         if res.returncode != 0:
             return []
@@ -214,11 +228,3 @@ class Session:
 
     def kill(self) -> None:
         _tmux("kill-session", "-t", self.target, check=False)
-
-
-def enable_activity_tracking() -> None:
-    """#{window_activity} 需要开 monitor-activity 才会更新。
-
-    这是 server 全局选项，副作用仅仅是状态栏会高亮有输出的窗口。
-    """
-    _tmux("set-option", "-g", "monitor-activity", "on", check=False)

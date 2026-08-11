@@ -1,29 +1,34 @@
-"""显卡：查询、稳定性判据、按队列顺序的原子分配。
+"""GPUs: querying, the stability test, and atomic allocation in queue order.
 
-这里是 tm 唯一跨 tick 持有状态的地方（显存采样历史 + 已分配的卡），
-而且这些状态**重启后重来一遍反而是对的**——稳定性本来就该重新确认，
-已分配的卡则从磁盘上活着的 run 里重建。所以它不需要持久化。
+This is the only place tm keeps state across ticks (VRAM sample history plus the
+allocation table), and rebuilding both after a restart is the correct behaviour
+anyway: stability should be re-established from scratch, and the allocation table is
+reconstructed from the runs still alive on disk. So none of it needs persisting.
 
-分配规则只有一条，每个 tick 从队列顶往下扫一遍：
+There is one allocation rule, applied top-down over the queue every tick:
 
     reserved = set()
-    for 每个待跑的 list（队列顺序 = 优先级）:
-        能用的 = 空闲卡 - 已分配 - reserved
-        够 -> 一次拿满，起飞
-        不够 -> 把它够得着的空卡塞进 reserved，后面的 list 这个 tick 别想碰
+    for each pending list (queue order = priority):
+        available = free cards - allocated - reserved
+        enough    -> take them all at once and start
+        not enough-> put the free cards it could have used into reserved, so lists
+                     below it cannot touch them this tick
 
-「原子拿满」消灭死锁（不存在持有并等待），reserved 消灭饥饿
-（要 2 张卡的 A 不会被后面要 1 张卡的 B 一张张叼光）。
-代价是卡会空转着等 A 凑齐——这是有意换来的可预测性。
+Taking all cards at once removes deadlock (there is no hold-and-wait), and reserved
+removes starvation (a list wanting 2 cards is not picked apart by a later list
+wanting 1). The cost is cards idling while the bigger list assembles its set —
+predictability bought on purpose.
 
-「已分配」默认就是独占：卡上有 run 就不再进候选。`exclusive: false` 的 list 才允许共享一张卡，
-这时判据有两条，缺一不可：
+Allocation is exclusive by default: a card with a run on it leaves the candidate
+pool. Only a list with `exclusive: false` may share, and then two tests both apply:
 
-    实测的 free（挡别人的进程）  和  total - 卡上各 run 声明的额度（挡我们自己的）
+    measured free (keeps out other people's processes)
+    total - sum of budgets declared by runs on the card (keeps out our own)
 
-第二条不能省。tm 刚把 A 起上去时 A 还在 import torch，nvidia-smi 看着卡是空的，
-只看实测值 B 就会挤进来，等两边都建完显存池一起 OOM。而 A 要吃多少 tm 是知道的——
-已知的事不该靠采样去猜。
+The second is not optional. Right after tm starts A, A is still importing torch and
+nvidia-smi shows the card as empty; going by the measured value alone lets B in, and
+both OOM once their memory pools are built. How much A intends to use is something
+tm already knows, and known facts should not be guessed at by sampling.
 """
 
 from __future__ import annotations
@@ -33,9 +38,12 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
-from .config import MIB_PER_GIB, ConfigError, WaitSpec
+from .config import ConfigError, WaitSpec
 
-# 显存采样历史保留多久。比任何合理的 stable_for 都长就行。
+# MiB is nvidia-smi's unit, so the conversion lives here. Callers speak GiB only.
+MIB_PER_GIB = 1024
+
+# How long to keep VRAM samples. Anything longer than a sane stable_for will do.
 HISTORY_SECONDS = 1800.0
 
 
@@ -43,7 +51,6 @@ HISTORY_SECONDS = 1800.0
 class Gpu:
     index: int
     total_mib: int
-    used_mib: int
     free_mib: int
     util: int = 0
 
@@ -57,11 +64,11 @@ class Gpu:
 
 
 def query_gpus() -> list[Gpu]:
-    """问 nvidia-smi 要每张卡的显存和利用率。一次约 40ms。"""
+    """Ask nvidia-smi for per-card memory and utilisation. About 40ms per call."""
     try:
         res = subprocess.run(
             ["nvidia-smi",
-             "--query-gpu=index,memory.total,memory.used,memory.free,utilization.gpu",
+             "--query-gpu=index,memory.total,memory.free,utilization.gpu",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=30, check=True)
     except FileNotFoundError:
@@ -72,11 +79,10 @@ def query_gpus() -> list[Gpu]:
     gpus: list[Gpu] = []
     for line in res.stdout.strip().splitlines():
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) != 5:
+        if len(parts) != 4:
             continue
         try:
-            gpus.append(Gpu(int(parts[0]), int(parts[1]), int(parts[2]),
-                            int(parts[3]), int(parts[4])))
+            gpus.append(Gpu(int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])))
         except ValueError:
             continue
     if not gpus:
@@ -86,7 +92,7 @@ def query_gpus() -> list[Gpu]:
 
 @dataclass
 class _History:
-    """一张卡的空闲显存采样。用来判断「连续 N 秒都够用」。"""
+    """Free-VRAM samples for one card, used to test "enough for N seconds running"."""
     samples: deque[tuple[float, int]] = field(default_factory=deque)
 
     def add(self, now: float, free_mib: int) -> None:
@@ -99,48 +105,47 @@ class _History:
         return bool(self.samples) and self.samples[-1][1] >= need_mib
 
     def stable(self, need_mib: int, window: float, now: float) -> bool:
-        """过去 window 秒里每一次采样都 >= need_mib 才算数。
+        """True only if every sample in the last `window` seconds was >= need_mib.
 
-        别人的任务刚启动时还没建显存池，这时候 nvidia-smi 看着卡是空的，
-        冲进去两边一起 OOM——所以要看一整段时间，不是看瞬时值。
+        A job that just started has not built its memory pool yet, so nvidia-smi
+        shows the card as empty; moving in then makes both sides OOM. Hence a whole
+        interval rather than an instantaneous reading.
         """
         if not self.samples:
             return False
         if window <= 0:
             return self.free_now(need_mib)
-        # 历史覆盖不到整个窗口（tm 刚起来）就还不能算稳定
+        # History not yet covering the full window (tm just started) is not stable
         if now - self.samples[0][0] < window:
             return False
         return all(free >= need_mib for ts, free in self.samples if ts >= now - window)
 
 
-@dataclass
-class Claim:
-    """一个 run 占着一张卡时留下的账。
-
-    owner 是 run 的目录名（唯一），不是 list 名——同名的 list 是允许的，
-    共享一张卡时按 list 名销账会连带把另一笔也抹掉。
-    budget 是这个 run 声明要吃的显存。
-    """
-    owner: str
-    budget_mib: int
-    exclusive: bool = True
+# One run's claim on one card: (owner, budget_mib, exclusive).
+#
+# owner is the run directory name, which is unique, not the list name: duplicate list
+# names are allowed, and releasing by list name would wipe someone else's claim on a
+# shared card. budget_mib is the VRAM that run declared it needs.
+Claim = tuple[str, int, bool]
 
 
 class GpuPool:
-    """显存采样 + 分配表。每个 tick 调一次 refresh()，然后按队列顺序 pick()。"""
+    """VRAM sampling plus the allocation table.
+
+    Call refresh() once per tick, then pick() in queue order.
+    """
 
     def __init__(self):
         self.gpus: list[Gpu] = []
-        self.claims: dict[int, list[Claim]] = {}   # 卡号 -> 占着它的 run
+        self.claims: dict[int, list[Claim]] = {}   # card index -> runs holding it
         self._history: dict[int, _History] = {}
         self._reserved: set[int] = set()
         self._now: float = 0.0
-        self.error: str | None = None            # 上次 nvidia-smi 出的错
+        self.error: str | None = None            # last nvidia-smi error, if any
 
-    # ---- 每个 tick ---------------------------------------------------------
+    # ---- per tick ------------------------------------------------------------
     def refresh(self) -> None:
-        """采一次样，并开启新一轮扫描（清空 reserved）。"""
+        """Take a sample and begin a new scan (clearing reserved)."""
         self._now = time.monotonic()
         self._reserved = set()
         try:
@@ -153,10 +158,11 @@ class GpuPool:
             self._history.setdefault(g.index, _History()).add(self._now, g.free_mib)
 
     def pick(self, spec: WaitSpec) -> list[int] | None:
-        """这个 list 现在能上机吗。能就返回卡号列表，不能就返回 None。
+        """Can this list start now? Returns the card indices, or None.
 
-        返回空列表表示「不需要显卡，直接跑」。
-        拿不满时会把够得着的空卡记进 reserved，挡住后面优先级更低的 list。
+        An empty list means "no GPU needed, run immediately". When the request cannot
+        be filled, the free cards it could have used go into reserved, blocking
+        lower-priority lists for the rest of this tick.
         """
         if not spec.manages_gpu:
             return []
@@ -173,45 +179,45 @@ class GpuPool:
                  and self._history[g.index].stable(need_mib, spec.stable_for, self._now)]
 
         if len(ready) >= spec.gpus:
-            ready.sort(key=lambda g: -g.free_mib)      # 空得最多的优先
+            ready.sort(key=lambda g: -g.free_mib)      # emptiest first
             return sorted(g.index for g in ready[:spec.gpus])
 
-        # 拿不满：一张都不拿（原子），但把够得着的空卡占住不让后面的抢走
+        # Cannot fill the request: take nothing (atomic), but hold the free cards it
+        # could have used so lists below cannot take them
         self._reserved |= {g.index for g in eligible
                            if self._history[g.index].free_now(need_mib)}
         return None
 
-    # ---- 分配表 ------------------------------------------------------------
+    # ---- allocation table ------------------------------------------------------
     def _can_join(self, g: Gpu, need_mib: int, exclusive: bool) -> bool:
-        """这张卡容不容得下我。空卡永远容得下。"""
+        """Does this card have room for me? An empty card always does."""
         held = self.claims.get(g.index) or []
         if not held:
             return True
-        if exclusive or any(c.exclusive for c in held):
-            return False          # 任一方声明独占，整张卡就独占
-        # 共享：账面上剩的够不够。不看实测值——那边由 stable() 单独把关
-        booked = sum(c.budget_mib for c in held)
+        if exclusive or any(is_exclusive for _, _, is_exclusive in held):
+            return False          # either side claiming exclusive makes it exclusive
+        # Sharing: is there budget left on paper? The measured value is stable()'s job
+        booked = sum(budget for _, budget, _ in held)
         return g.total_mib - booked >= need_mib
 
     def allocate(self, indices: list[int], owner: str,
-                 budget_mib: int = 0, exclusive: bool = True) -> None:
+                 budget_gb: float = 0.0, exclusive: bool = True) -> None:
+        """Book `budget_gb` per card for `owner`. GiB in, MiB kept internally."""
+        budget_mib = int(budget_gb * MIB_PER_GIB)
         for i in indices:
-            self.claims.setdefault(i, []).append(Claim(owner, budget_mib, exclusive))
+            self.claims.setdefault(i, []).append((owner, budget_mib, exclusive))
 
     def release(self, indices: list[int], owner: str) -> None:
-        """只销 owner 自己那笔账，同卡上别人的留着。"""
+        """Release only this owner's claim, leaving others on the same card."""
         for i in indices:
-            held = [c for c in self.claims.get(i, []) if c.owner != owner]
+            held = [c for c in self.claims.get(i, []) if c[0] != owner]
             if held:
                 self.claims[i] = held
             else:
                 self.claims.pop(i, None)
 
-    def rebuild(self, owned: list[tuple[str, list[int], int, bool]]) -> None:
-        """从磁盘上还活着的 run 重建分配表。tm 重启后第一件事。"""
+    def rebuild(self, owned: list[tuple[str, list[int], float, bool]]) -> None:
+        """Rebuild the table from runs still alive on disk. First thing after a restart."""
         self.claims = {}
-        for name, indices, budget_mib, exclusive in owned:
-            self.allocate(indices, name, budget_mib, exclusive)
-
-    def owners(self, index: int) -> list[str]:
-        return [c.owner for c in self.claims.get(index, [])]
+        for name, indices, budget_gb, exclusive in owned:
+            self.allocate(indices, name, budget_gb, exclusive)
