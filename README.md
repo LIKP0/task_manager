@@ -159,7 +159,7 @@ checkpoint the previous step just wrote:
 | `gpus` | `1` | How many cards |
 | `gpu_index` | `any` | Restrict the candidates: `any` / `0` / `[0, 1]`. Must list at least `gpus` of them |
 | `stable_for` | `120` | **Seconds**, max 1800. How long the condition must hold continuously. The cap is the sample history tm keeps; a larger window could never be satisfied, so it is rejected rather than accepted and never met |
-| `timeout` | none | **Seconds** (`7200` = two hours). Give up on this list after waiting this long, mark it `timeout` and move on. The timer lives only in tm's memory, so restarting tm restarts the count |
+| `timeout` | none | **Seconds** (`7200` = two hours). Give up on this list after waiting this long, mark it `timeout` and move on. The clock is frozen while `tm hold` is in effect, but it lives only in tm's memory, so restarting tm restarts the count |
 | `exclusive` | `true` | No second tm run may share the card. `false` allows sharing, below |
 
 Every key except `gpu_free_gb` is rejected without it. `gpus: 2` with `gpu_index: [0]`
@@ -336,6 +336,17 @@ no attach:
 Later steps do not run. `tm ls` shows the list as `FAILED  ccfm_c  1/3`. When you are
 done looking, `tm clean -y` removes the leftover sessions; running ones are never
 touched.
+
+Every run ends in one of six states, shown in the `RECENT` column:
+
+| State | Meaning |
+|---|---|
+| `ok` | Every step exited 0 |
+| `FAILED` | A step exited non-zero; the rest were skipped. The line gives `step<N> <name> rc=<code>` |
+| `LOST` | The session vanished with no exit code — **treated as a failure**, since no evidence means failure |
+| `TIMOUT` | `wait.timeout` expired before a card was free; it never started |
+| `ABORT` | Refused before starting (usually the `trainer.devices` check), or the session could not be launched |
+| `BROKEN` | The run directory has no readable `run.yaml`. It is never reported as done — a run that executed nothing must not look successful |
 
 `tm ls` looks roughly like this:
 
