@@ -3,15 +3,20 @@ __pycache__/
 testbench/_out/
 testbench/_tmroot/
 
-# tm 的运行时状态。默认就落在仓库目录里（不是 ~/.tm），方便随手翻，
-# 但它不是代码：队列内容、run 记录、锁、暂停标记都不进版本控制。
+# tm's runtime state. It lives in the repo directory (not ~/.tm) so it is easy to
+# browse, but it is not code: queue contents, run records, the lock and the pause
+# flag stay out of version control.
 /queue/
 /runs/
 /lock
 /paused
 /.writable
 
-# 你自己的 task list。目录保留（.gitkeep），内容不进版本控制——
-# 实验清单改得勤，跟工具的历史混在一起没意义。模板见根目录 task_list.yaml。
+# Your own task lists. The directory is kept via .gitkeep, the contents are not
+# tracked: experiment lists change constantly and do not belong in the tool's
+# history. See task_list.example.yaml for the template.
 /lists/*
 !/lists/.gitkeep
+
+# Personal lab notes; not published.
+/claude_notes/
