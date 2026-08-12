@@ -62,13 +62,21 @@ tm [--root DIR] <subcommand>
 
 | Option | Applies to | What it does |
 |---|---|---|
-| `--root DIR` | global | Override the state directory (default: the repo). `TM_ROOT` does the same |
+| `--root DIR` | global | Override the state directory (default: the repo). `TM_ROOT` does the same. Mostly test scaffolding — see below |
 | `--once` | `run` | Exit when the queue drains instead of standing by |
 | `--seq N` | `add` | Sequence number; appended to the end by default |
 
 The command line carries **mode switches only, never settings**. Settings live in
 `tm_config.yaml`, and there is no way to override the contents of a task list from the
 command line either.
+
+`--root` exists for the test suite, not for daily use. All disk access goes through
+one object, so pointing it elsewhere gives the testbench a throwaway state tree
+instead of dirtying the repo's own `queue/` and `runs/` (`testbench/suite.sh` sets
+`TM_ROOT`). The one real-world case is a repo on a read-only or network filesystem
+that cannot hold the state itself. It is **not** a way to run two queues at once: the
+lock is per root, so two tm processes with different roots each hold their own, see
+the same physical cards, and hand the same GPU to both.
 
 ## tm's settings: `tm_config.yaml`
 
@@ -159,7 +167,7 @@ checkpoint the previous step just wrote:
 | `gpus` | `1` | How many cards |
 | `gpu_index` | `any` | Restrict the candidates: `any` / `0` / `[0, 1]`. Must list at least `gpus` of them |
 | `stable_for` | `120` | **Seconds**, max 1800. How long the condition must hold continuously. The cap is the sample history tm keeps; a larger window could never be satisfied, so it is rejected rather than accepted and never met |
-| `timeout` | none | **Seconds** (`7200` = two hours). Give up on this list after waiting this long, mark it `timeout` and move on. The clock is frozen while `tm hold` is in effect, but it lives only in tm's memory, so restarting tm restarts the count |
+| `timeout` | none | **Seconds** (`7200` = two hours). Give up on this list after waiting this long, mark it `timeout` and move on. **Omitting it means waiting for ever, not refusing to wait**, and that is the right default: a timeout does not keep the list queued, it takes the yaml out of `queue/` having run nothing, so a card that frees up on day four finds nothing to run. The clock is frozen while `tm hold` is in effect, but it lives only in tm's memory, so restarting tm restarts the count |
 | `exclusive` | `true` | No second tm run may share the card. `false` allows sharing, below |
 
 Every key except `gpu_free_gb` is rejected without it. `gpus: 2` with `gpu_index: [0]`
