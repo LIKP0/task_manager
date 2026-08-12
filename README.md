@@ -179,6 +179,24 @@ then and both sides OOM thirty seconds later. Requiring the condition to hold
 **continuously** for two minutes closes almost all of that window, and the only cost
 is two minutes.
 
+`gpu_free_gb` is **per card**, so `gpus: 2` with `gpu_free_gb: 40` asks for two cards
+with 40 GiB free each, not 80 GiB in total.
+
+`tm check` and `tm add` measure the request against the machine and refuse one no
+card can ever satisfy — `gpu_free_gb` larger than any card, or more `gpus` than exist:
+
+```
+error: big.yaml: gpu_free_gb: 200.0 is per card and needs 1 card(s) that big,
+       but 0 qualify (gpu0: 95.6 GiB, gpu1: 95.6 GiB) — the list can never start
+```
+
+Without it such a list queues cleanly and then waits for ever, indistinguishable in
+`tm ls` from one waiting its turn. This is the only rule in `tm add` that depends on
+the machine rather than the file, so it is skipped where nvidia-smi is absent rather
+than refusing a yaml written for a different host. Only the totals are read; a busy
+card is irrelevant. A list copied into `queue/` by hand skips both commands and so
+skips this check too.
+
 Do not use `on:` as a key. YAML 1.1 parses bare `on`/`off`/`yes`/`no` as booleans —
 the well-known GitHub Actions trap — which is why the key for choosing cards is
 called `gpu_index`.

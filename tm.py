@@ -37,7 +37,7 @@ from pathlib import Path
 from tmlib import runner
 from tmlib.config import (ConfigError, check_device_settings, load_plan,
                           unescape_braces)
-from tmlib.gpu import GpuPool
+from tmlib.gpu import Gpu, GpuPool, capacity_problem, query_gpus
 from tmlib.settings import Settings, config_path, load_settings
 from tmlib.store import LockBusy, Store, StoreError, now_stamp as store_now
 from tmlib.view import Style, describe_wait, render
@@ -366,8 +366,23 @@ def cmd_ls(store: Store, args, st: Style) -> int:
     return 0
 
 
+def _machine_cards(st: Style) -> list[Gpu]:
+    """The cards on this machine, or [] with a note saying they could not be read.
+
+    Shared by `add` and `check` so that "we could not size your request" is worded
+    once and reported by both. An unreadable machine must not refuse a list: the yaml
+    may well be written for a host that does have cards.
+    """
+    try:
+        return query_gpus()
+    except ConfigError as exc:
+        print(st.dim(f"  (cannot size the request: {exc})"))
+        return []
+
+
 def cmd_add(store: Store, args, st: Style) -> int:
     rc = 0
+    cards: list[Gpu] | None = None          # sampled at most once, and only if asked for
     for src in args.files:
         if not src.is_file():
             print(st.red(f"error: not found: {src}"), file=sys.stderr)
@@ -376,9 +391,21 @@ def cmd_add(store: Store, args, st: Style) -> int:
         try:
             # Validate first, so bad yaml never reaches the queue. add and run see
             # the same file under the same rules, so passing here means passing there.
-            load_plan(src)
+            plan = load_plan(src)
         except ConfigError as exc:
             print(st.red(f"error: {src}: {exc}"), file=sys.stderr)
+            rc = 2
+            continue
+        # Unlike the rules above, this one is about the machine, not the file: a list
+        # that no card here can satisfy would sit in the queue looking like it was
+        # waiting its turn, for ever. Deliberately not folded into the ConfigError
+        # above: that exception means the yaml is wrong, and this one does not.
+        if plan.wait.manages_gpu and cards is None:
+            # Only the sizes are read, so a busy card is irrelevant; sampled here
+            # rather than up front so a batch of cpu-only lists never shells out.
+            cards = _machine_cards(st)
+        if problem := capacity_problem(plan.wait, cards or []):
+            print(st.red(f"error: {src}: {problem}"), file=sys.stderr)
             rc = 2
             continue
         dst = store.add(src, seq=args.seq)
@@ -414,6 +441,8 @@ def cmd_check(store: Store, args, st: Style) -> int:
         print(f"  {st.cyan(f'[{i}] {t.name}')}  {unescape_braces(t.cmd)}")
     if spec.manages_gpu:
         problems = check_device_settings(plan.tasks, plan.cwd, spec.gpus)
+        if problem := capacity_problem(spec, _machine_cards(st)):
+            problems.append(problem)
         for msg in problems:
             print(st.red(f"  ! {msg}"))
         if problems:

@@ -93,6 +93,54 @@ def query_gpus() -> list[Gpu]:
     return gpus
 
 
+def _need_mib(spec: WaitSpec) -> int:
+    """The per-card VRAM a spec asks for, in nvidia-smi's unit."""
+    return int(spec.gpu_free_gb * MIB_PER_GIB)
+
+
+def _in_scope(g: Gpu, spec: WaitSpec) -> bool:
+    """Does `gpu_index` allow this card at all? (None means any.)"""
+    return spec.gpu_index is None or g.index in spec.gpu_index
+
+
+def capacity_problem(spec: WaitSpec, gpus: list[Gpu]) -> str | None:
+    """Could this request ever be filled, with every card on the machine idle?
+
+    pick() cannot tell "the cards are busy" from "no card is that big" — both are
+    None, so a list asking for more VRAM than exists waits for ever and looks exactly
+    like a list waiting its turn. This is what turns the second case into an error.
+    It shares pick()'s two static filters and skips the rest (the allocation table and
+    the sample history), so `tm check` and `tm add` can run it with no scheduler alive.
+
+    `gpu_free_gb` is per card, so a two-card request is measured against one card's
+    total rather than the sum.
+
+    An empty `gpus` means "the machine was never measured" — nvidia-smi raises rather
+    than reporting zero cards — so it answers None. Every caller reaches that state by
+    a query that failed, and none of them wants a verdict from a failed query.
+    """
+    if not spec.manages_gpu or not gpus:
+        return None
+    need_mib = _need_mib(spec)
+    candidates = [g for g in gpus if _in_scope(g, spec)]
+    fits = [g for g in candidates if g.total_mib >= need_mib]
+    if len(fits) >= spec.gpus:
+        return None
+
+    # Same spelling of a card list as describe_wait(), which `tm check` prints three
+    # lines above this message.
+    scope = ("" if spec.gpu_index is None
+             else " within gpu " + ",".join(map(str, spec.gpu_index)))
+    if len(fits) == len(candidates):
+        # Every eligible card is big enough; there are simply too few of them.
+        why = f"gpus: {spec.gpus}, but this machine has {len(candidates)} card(s){scope}"
+    else:
+        sizes = ", ".join(f"gpu{g.index}: {g.total_gib:.1f} GiB" for g in candidates)
+        why = (f"gpu_free_gb: {spec.gpu_free_gb:.1f} is per card and needs "
+               f"{spec.gpus} card(s) that big, but {len(fits)} qualify{scope} ({sizes})")
+    return f"{why} — the list can never start"
+
+
 @dataclass
 class _History:
     """Free-VRAM samples for one card, used to test "enough for N seconds running"."""
@@ -172,9 +220,9 @@ class GpuPool:
         if self.error:
             return None
 
-        need_mib = int(spec.gpu_free_gb * MIB_PER_GIB)
+        need_mib = _need_mib(spec)
         eligible = [g for g in self.gpus
-                    if (spec.gpu_index is None or g.index in spec.gpu_index)
+                    if _in_scope(g, spec)
                     and self._can_join(g, need_mib, spec.exclusive)]
 
         ready = [g for g in eligible
