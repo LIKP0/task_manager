@@ -23,6 +23,10 @@ SILENT_WARN = 30 * 60.0
 LOW_FREE_GIB = 5.0
 BUSY_UTIL_PCT = 50
 
+# Finished runs `tm ls` shows unless given -a. Failures get no exemption: the cap is
+# about how long the listing is, and the line below it says how many were left out.
+RECENT_SHOWN = 10
+
 
 class Style:
     def __init__(self, enabled: bool | None = None):
@@ -83,7 +87,7 @@ def describe_gpus(indices: list[int], empty: str) -> str:
     return ",".join(f"gpu{g}" for g in indices) or empty
 
 
-def render(store: Store, st: Style) -> list[str]:
+def render(store: Store, st: Style, show_all: bool = False) -> list[str]:
     """The complete output of `tm ls`."""
     out: list[str] = []
     sessions = set(runner.list_sessions())
@@ -137,12 +141,13 @@ def render(store: Store, st: Style) -> list[str]:
             out.append(f"  {path.name:<24} {st.red('BAD: ' + str(exc).splitlines()[0])}")
 
     # ---- finished --------------------------------------------------------------
-    # Every finished run, newest first — no truncation. runs/ is the whole history,
-    # and a cut-off list quietly hides the run you were looking for.
+    # Newest first, capped at RECENT_SHOWN. runs/ is the whole history, so the cut is
+    # always announced: a list that stops silently hides the run you were looking for.
+    hidden = 0 if show_all else max(0, len(finished) - RECENT_SHOWN)
     if finished:
         out.append("")
         out.append(st.bold("RECENT"))
-    for run in finished:
+    for run in finished[:len(finished) - hidden]:
         done, fail_i, fail_rc = run.scan()
         tasks = run.tasks
         mark = {"done": st.green("ok    "), "failed": st.red("FAILED"),
@@ -157,6 +162,8 @@ def render(store: Store, st: Style) -> list[str]:
             if rec.session in sessions:
                 line += st.dim(f"  -> tmux attach -t {rec.session}")
         out.append(line)
+    if hidden:
+        out.append(st.dim(f"  ... {hidden} more, tm ls -a for all"))
 
     # ---- gpus ------------------------------------------------------------------
     try:

@@ -361,7 +361,7 @@ def _start_pending(store: Store, pool: GpuPool, st: Style, args,
 # --------------------------------------------------------------------------- #
 
 def cmd_ls(store: Store, args, st: Style) -> int:
-    for line in render(store, st):
+    for line in render(store, st, show_all=args.all):
         print(line)
     return 0
 
@@ -534,7 +534,9 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--once", action="store_true",
                      help="exit when the queue drains instead of standing by")
 
-    sub.add_parser("ls", help="show progress (works when tm is not running)")
+    ls = sub.add_parser("ls", help="show progress (works when tm is not running)")
+    ls.add_argument("-a", "--all", action="store_true",
+                    help="every finished run, not just the newest 10")
 
     add = sub.add_parser("add", help="add a yaml to the queue")
     add.add_argument("files", nargs="+", type=Path)

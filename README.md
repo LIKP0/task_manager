@@ -53,7 +53,7 @@ tm [--root DIR] <subcommand>
 | Subcommand | What it does |
 |---|---|
 | `tm` / `tm run` | Consume the queue. Stays resident and stands by when empty |
-| `tm ls` | Progress: running, queued, every finished run, and free VRAM per card |
+| `tm ls [-a]` | Progress: running, queued, the newest 10 finished runs (`-a` for all), and free VRAM per card |
 | `tm add F...` | Add yaml files to the queue (validated first; bad ones are refused) |
 | `tm check F` | Parse without running: see how variables expand and what it will wait for |
 | `tm attach [name]` | Attach to a running task; lists them if there are several |
