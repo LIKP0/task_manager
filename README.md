@@ -390,8 +390,8 @@ RECENT
   FAILED  tpipe          0/2       1s  08-08 23:49  step1 piped rc=3
 
 GPUS
-  gpu0:   52.8/95.6 GiB free   util 100%
-  gpu1:   94.9/95.6 GiB free   util   0%
+  gpu0:   42.8/95.6 GiB used   util 100%
+  gpu1:    0.7/95.6 GiB used   util   0%
 ```
 
 ### Stuck jobs are flagged, never killed

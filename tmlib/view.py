@@ -173,7 +173,8 @@ def render(store: Store, st: Style, show_all: bool = False) -> list[str]:
         for g in gpus:
             bar = (st.red if g.free_gib < LOW_FREE_GIB else
                    st.yellow if g.util > BUSY_UTIL_PCT else st.green)
-            out.append(f"  gpu{g.index}: {bar(f'{g.free_gib:6.1f}')}/{g.total_gib:.1f} GiB free"
+            used = g.total_gib - g.free_gib
+            out.append(f"  gpu{g.index}: {bar(f'{used:6.1f}')}/{g.total_gib:.1f} GiB used"
                        f"   util {g.util:3d}%")
     except ConfigError as exc:
         out.append("")
