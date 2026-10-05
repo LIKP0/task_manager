@@ -33,6 +33,7 @@ files the tasks write themselves, and all of it lives in the repo directory next
   tm_config.yaml              tm's own settings (tracked in git)
                               everything below is gitignored: runtime state is not code
   lock                        single-instance mutex (flock, released on death)
+  paused                      present while `tm hold` is in effect
   queue/010_ccfm_c.yaml       here = not started. Copying one in == tm add
   runs/20260808_143301_ccfm_c/
                               here = in progress
@@ -41,7 +42,7 @@ files the tasks write themselves, and all of it lives in the repo directory next
                               command for each step
     01.sh                     the wrapper script tmux actually executes
     01.rc                     *the exit code the task wrote* — the only evidence
-    events.log
+    events.log                one line per claim, step start and state change
   archive/20260807_090000_ccfm_b/
                               here = finished; same contents, never touched again
 ```
@@ -51,8 +52,11 @@ keep appearing after tm dies, and tm has no say in what they contain.
 
 Where a list sits says where it is in its life: `queue/` → `runs/` → `archive/`. tm
 moves a run into `archive/` as soon as it records the final state, so the scheduler
-reads only `runs/` each tick and costs the same however long the history grows. The
-history only takes disk space; `tm prune` clears it when you want.
+reads only `runs/` each tick and costs the same however long the history grows. A
+list skipped before it ever starts (timed out, or refused by the device check) goes
+straight from `queue/` to `archive/`. A finished run still in `runs/` was finished
+by a tm that died before moving it; the next tick moves it. The history only takes
+disk space; `tm prune` clears it when you want.
 
 ## Commands
 
@@ -63,10 +67,10 @@ tm [--root DIR] <subcommand>
 | Subcommand | What it does |
 |---|---|
 | `tm` / `tm run` | Consume the queue. Stays resident and stands by when empty |
-| `tm ls [-a]` | Progress: running, queued, the newest 10 finished runs (`-a` for all), and free VRAM per card |
-| `tm add F...` | Add yaml files to the queue (validated first; bad ones are refused) |
-| `tm check F` | Parse without running: see how variables expand and what it will wait for |
-| `tm attach [name]` | Attach to a running task; lists them if there are several |
+| `tm ls [-a]` | Progress: running, queued, the newest 10 finished runs (`-a` for all), and used VRAM and utilisation per card |
+| `tm add F...` | Add yaml files to the queue. Each is parsed and capacity-checked first; a bad one is refused and never reaches the queue |
+| `tm check F` | Parse without running: how variables expand, what it will wait for, plus the device and capacity checks. Exit 2 if any fails |
+| `tm attach [name]` | Attach to the running step. With a name, any tmux session containing it; lists them if several match |
 | `tm clean [-y]` | Remove tmux sessions left by failures. Lists them unless given `-y` |
 | `tm prune [-d N] [-n N] [-y]` | Delete finished runs from `archive/` past either limit (default 30 days / newest 30). Lists them unless given `-y` |
 | `tm hold` / `tm resume` | Pause and resume **queue scanning**, so you can edit it |
@@ -85,10 +89,11 @@ command line either.
 
 `--root` exists for testing, not for daily use. All disk access goes through one
 object, so pointing it elsewhere gives a test a throwaway state tree instead of
-dirtying the repo's own `queue/` and `runs/`. The one real-world case is a repo on a read-only or network filesystem
-that cannot hold the state itself. It is **not** a way to run two queues at once: the
-lock is per root, so two tm processes with different roots each hold their own, see
-the same physical cards, and hand the same GPU to both.
+dirtying the repo's own `queue/` and `runs/`. The one real-world case is a repo on a
+read-only or network filesystem that cannot hold the state itself. It is **not** a
+way to run two queues at once: the lock is per root, so two tm processes with
+different roots each hold their own, see the same physical cards, and hand the same
+GPU to both.
 
 ## tm's settings: `tm_config.yaml`
 
@@ -153,14 +158,16 @@ Each task is `{name, cmd}`; a bare string works too and is named `step1`, `step2
 **Names may use letters, digits, `_` and `-` only**, because they become part of a
 tmux session name and `.` and `:` are tmux target separators.
 
-The run id in a session name is that run's start date and time. It is what lets you re-queue
-a list whose previous run failed: the failed pane stays pinned, and without a run id
-the retry would collide with it and be aborted before running a step.
+The run id in a session name is that run's start date and time. It is what lets you
+re-queue a list whose previous run failed: the failed pane stays pinned, and without a
+run id the retry would collide with it and be aborted before running a step.
 
 An undefined `{KEY}` is an error rather than a silent pass-through, so a typo in a
 path never costs you hours. Write `{{` / `}}` for literal braces (python f-strings,
 awk's `{{print $1}}`). `{GPU}` is special: it expands after a card is acquired, to
-the **physical index**, which makes it useful for naming output directories.
+the **physical index** (`0,1` for two cards), which makes it useful for naming output
+directories. Commands are expanded once, at claim time, and run.yaml stores the exact
+line handed to tmux; list.yaml is never re-read after that.
 
 Commands go to bash, so `&&`, pipes, `$(...)` and environment prefixes all work.
 `$(...)` is evaluated **when that step actually starts**, so it can pick up a
@@ -190,6 +197,11 @@ and has not built its memory pool, so nvidia-smi shows the card as empty; move i
 then and both sides OOM thirty seconds later. Requiring the condition to hold
 **continuously** for two minutes closes almost all of that window, and the only cost
 is two minutes.
+
+Stability is judged from a history of VRAM samples, one per tick (`poll`), kept for
+`1800 + 60` seconds — just over the largest `stable_for` accepted. The history lives
+only in memory, so a restarted tm re-establishes stability from scratch, which is the
+right behaviour anyway.
 
 `gpu_free_gb` is **per card**, so `gpus: 2` with `gpu_free_gb: 40` asks for two cards
 with 40 GiB free each, not 80 GiB in total.
@@ -291,6 +303,10 @@ tm add list.yaml                        # writes .tmp then renames
 cp list.yaml queue/015_x.yaml.tmp && mv queue/015_x.yaml{.tmp,}
 ```
 
+A file copied in by hand without a number (`zzz.yaml`) still sorts by name, so a
+later `tm add` can land ahead of it. `tm add` warns when the file it just queued did
+not land last.
+
 To edit several files without anything being picked up mid-edit, use `tm hold`:
 
 ```bash
@@ -329,10 +345,13 @@ What actually executes for each step is written to `NN.sh` in the run directory:
 ```bash
 #!/usr/bin/bash
 # tm: tm-ccfm_c-20260808-143301-01-train
+# Everything tm hands to tmux. Run it directly to reproduce this step.
 set -o pipefail
 cd /home/me/my_project || exit 1
 
-( python train.py --config config/xxx.yaml )
+(
+python train.py --config config/xxx.yaml
+)
 rc=$?
 
 echo $rc > .../01.rc.tmp && mv .../01.rc.tmp .../01.rc
@@ -341,13 +360,19 @@ echo $rc > .../01.rc.tmp && mv .../01.rc.tmp .../01.rc
 exec bash -i
 ```
 
+tmux itself is handed one line, `bash <path>/01.sh`, which every login shell (fish,
+csh, zsh) runs the same way, so the user's default shell never has to be POSIX.
+
 Points worth knowing:
 
 - **`set -o pipefail`**: a POSIX pipeline's exit status is that of its last command,
   so in `python train.py | tee log` a crashed train still yields 0. pipefail gets the
-  real value. To ignore a failure deliberately, write your own `|| true`.
+  real value. To ignore a failure deliberately, write your own `|| true`. Without
+  bash, tm falls back to `sh` and drops pipefail.
 - **The `( )` subshell**: if the command calls `exit` (or ends in `exec`), running it
   unwrapped would take the wrapper with it and the rc file would never be written.
+  The parentheses sit on lines of their own so that a trailing `# comment` in the
+  command cannot comment out the `)`.
 - **`.tmp` then `mv`**: rename is atomic, so the rc file is either absent or complete.
 - **Succeed and vanish, fail and stay pinned**: successful sessions exit and leave no
   junk; failed panes keep their full scrollback, and attaching gives an interactive
@@ -356,8 +381,22 @@ Points worth knowing:
   runs as before, but the script still names its rc file under `runs/`, so that one
   write fails — a rerun cannot overwrite the evidence of the original run.
 
+### The task's environment
+
 tm injects two environment variables: `PYTHONUNBUFFERED=1`, and `CUDA_VISIBLE_DEVICES`
 when a card was acquired.
+
+Everything else comes from tmux, not from tm. Measured on tmux 3.2a: the pane gets
+tm's `PATH`, but every other variable comes from the environment the **tmux server**
+was first started in. So `python` resolves to the interpreter of the conda env tm was
+started from and training runs, but `CONDA_PREFIX`, `CONDA_DEFAULT_ENV` and
+`LD_LIBRARY_PATH` set by `conda activate` are lost if the server was started outside
+that env. Jobs that only need the interpreter are unaffected. Jobs that depend on
+those variables (self-built CUDA extensions, scripts reading `CONDA_PREFIX`) should
+set them in the command, or start the tmux server from the activated env.
+
+The pane kept open after a failure is a fresh `bash -i`, which reads `~/.bashrc`, so
+conda is live there when you attach.
 
 ## When something fails
 
@@ -394,19 +433,28 @@ Every run ends in one of six states, shown in the `RECENT` column:
 tm: pid 31337 since 2026-08-08 14:20:11
 
 RUNNING
-  ccfm_c         gpu1     [2/3] test          1h04m   -> tmux attach -t tm-ccfm_c-20260808-143301-02-test
+  ccfm_c         gpu1     [2/3] test           1h04m  -> tmux attach -t tm-ccfm_c-20260808-143301-02-test
 
 QUEUED   (order = priority; rename to change it)
   020_ddpm_fdg.yaml        2 tasks   1x50GiB on any gpu
+  030_broken.yaml          BAD: .../queue/030_broken.yaml: missing 'tasks:'
 
 RECENT
   ok      tok            3/3       3s  08-08 23:49
   FAILED  tpipe          0/2       1s  08-08 23:49  step1 piped rc=3
+  ... 14 more, tm ls -a for all
 
 GPUS
   gpu0:   42.8/95.6 GiB used   util 100%
   gpu1:    0.7/95.6 GiB used   util   0%
 ```
+
+The first line says `not running` when no tm holds the lock (it tries the flock
+rather than trusting the pid written in the file, which outlives a hard-killed tm),
+and adds `[queue paused · tm resume]` during a hold. A running step whose session has
+already vanished shows `session gone` until the next tick marks it LOST. The GPU
+figures are coloured red when a card has under 5 GiB free and yellow above 50%
+utilisation.
 
 ### Stuck jobs are flagged, never killed
 
@@ -416,15 +464,34 @@ are all long silences, and an automatic kill would eventually hit a healthy job 
 it was writing a checkpoint — precisely the worst moment to interrupt. Whether to kill
 it is your call.
 
+### When tm itself hits trouble
+
+One bad list or one bad directory never takes the scheduler down with it; everything
+else keeps running. Each problem is reported once, not every tick.
+
+| Problem | What tm does |
+|---|---|
+| A queued yaml does not parse | Skipped and shown as `BAD:` in `tm ls`; picked up automatically once fixed |
+| A claim fails on disk | Reported; the list is left for the next tick. If the yaml already left `queue/`, the run directory without a run.yaml turns into `BROKEN` next tick — loud rather than silent |
+| tmux cannot launch a step | The run is marked `ABORT` and its cards released |
+| A run directory becomes unwritable | That run is set aside. **Its cards stay reserved**: tm cannot tell whether the task is still on them, and handing them out would be the one unrecoverable mistake. Fix the directory and restart tm |
+| A finished run cannot be moved to `archive/` | It stays in `runs/`, costing one run.yaml read per tick; a restarted tm tries again |
+| The state directory is not writable at startup | `error: ... is not writable`, exit 2, before anything starts |
+
 ## Configs must use relative device indices
 
 After picking cards, tm sets `CUDA_VISIBLE_DEVICES=<physical index>`, so the child
 process sees only `gpus` cards numbered from 0. A config saying `trainer.devices: [1]`
 then fails to find its card, and so does `test.py --cuda 1`.
 
-So **tm checks this before starting**: it extracts `--config <path>` from each
-command, reads that yaml, and refuses to start the list if `trainer.devices` is wrong
-— rather than letting you find out six hours later.
+So **tm checks this before starting** — rather than letting you find out six hours
+later:
+
+- every `--config <path>` in each command (several per step are all checked): if the
+  yaml has `trainer.devices`, it must be `[0, ..., gpus-1]`, `gpus`, `-1` or `auto`.
+  The last two mean "every visible card", which is exactly the cards tm assigned. A
+  config without `trainer.devices`, or one that cannot be read, is left alone.
+- every `--cuda N`: N must be below `gpus`.
 
 ```
 tm: ddpm_fdg failed the config device check, skipping:
@@ -432,8 +499,14 @@ tm: ddpm_fdg failed the config device check, skipping:
       trainer.devices is [1], must be [0] (or 1, -1, auto) — tm assigns the physical card via CUDA_VISIBLE_DEVICES
 ```
 
-Use `{GPU}` when you want the physical index (for logs or output directory names). If
-your configs have a different shape and the check only false-alarms, set
+The check applies only to lists with `gpu_free_gb`, since only they get
+`CUDA_VISIBLE_DEVICES`. It runs in `tm check`, and again when the list reaches the
+front of the queue, where a failing list is marked `ABORT` and moved to `archive/`
+instead of retrying for ever. `tm add` does not run it.
+
+Use `{GPU}` when you want the physical index (for logs or output directory names). The
+check knows only these two conventions (Lightning-style `trainer.devices` and a
+`--cuda` flag); if your configs have a different shape and it false-alarms, set
 `device_check: false` in `tm_config.yaml`.
 
 ## Logs
