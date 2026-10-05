@@ -103,22 +103,8 @@ def _loop(store: Store, args, st: Style) -> int:
                       for r in active])
 
         for run in active:
-            if run.path in stuck:
-                continue
-            try:
-                _advance(run, pool, st)
-            except OSError as exc:
-                # _advance writes run.yaml (set_state), so a run directory that has
-                # gone unwritable raises here. Killing the scheduler over one run
-                # would strand every other run and every queued list, so report it
-                # once and stop trying. Its cards stay booked above — tm cannot tell
-                # whether the task is still on them, and handing them out would be
-                # the one unrecoverable mistake.
-                stuck.add(run.path)
-                print(st.red(f"tm: cannot manage {run.name} any more: {exc}"))
-                print(st.dim(f"    {run.path}"))
-                print(st.dim("    its gpus stay reserved; fix the directory and "
-                             "restart tm to pick it up again"))
+            if run.path not in stuck:
+                _try_advance(run, pool, st, stuck)
 
         paused = store.paused()
         if paused:
@@ -144,7 +130,7 @@ def _loop(store: Store, args, st: Style) -> int:
             if pause_announced:
                 print(st.green("tm: queue scanning resumed."))
                 pause_announced = False
-            _start_pending(store, pool, st, args, waiting_since, complained)
+            _start_pending(store, pool, st, args, waiting_since, complained, stuck)
 
         # Re-read: _advance and _start_pending both change what is active. Runs tm
         # can no longer manage do not count — otherwise --once would never finish.
@@ -231,6 +217,23 @@ def _advance(run, pool: GpuPool, st: Style) -> None:
         print(st.dim("    session gone with no exit code — hard-killed or the machine rebooted"))
 
 
+def _try_advance(run, pool: GpuPool, st: Style, stuck: set[Path]) -> None:
+    """_advance(), with a run whose directory has gone unwritable set aside."""
+    try:
+        _advance(run, pool, st)
+    except OSError as exc:
+        # _advance writes run.yaml (set_state), so a run directory that has gone
+        # unwritable raises here. Killing the scheduler over one run would strand
+        # every other run and every queued list, so report it once and stop trying.
+        # Its cards stay booked — tm cannot tell whether the task is still on them,
+        # and handing them out would be the one unrecoverable mistake.
+        stuck.add(run.path)
+        print(st.red(f"tm: cannot manage {run.name} any more: {exc}"))
+        print(st.dim(f"    {run.path}"))
+        print(st.dim("    its gpus stay reserved; fix the directory and "
+                     "restart tm to pick it up again"))
+
+
 def _print_tail(rec, st: Style, lines: int = 12) -> None:
     """Print the last lines of the pane on failure, so reading the error needs no attach."""
     tail = runner.Session(rec.session).capture(lines)
@@ -289,7 +292,7 @@ def _claim(store: Store, path: Path, plan, gpus: list[int], st: Style,
 
 def _start_pending(store: Store, pool: GpuPool, st: Style, args,
                    waiting_since: dict[Path, float],
-                   complained: dict[Path, str]) -> None:
+                   complained: dict[Path, str], stuck: set[Path]) -> None:
     """Scan the queue in order and start whatever can start.
 
     Order is priority: a list that cannot fill its request reserves the free cards it
@@ -356,7 +359,7 @@ def _start_pending(store: Store, pool: GpuPool, st: Style, args,
         waiting_since.pop(path, None)
         where = ",".join(f"gpu{g}" for g in gpus) or "no gpu"
         print(st.bold(f"\ntm: start {plan.name} on {where}  ({len(plan.tasks)} tasks)"))
-        _advance(run, pool, st)
+        _try_advance(run, pool, st, stuck)
 
 
 # --------------------------------------------------------------------------- #
