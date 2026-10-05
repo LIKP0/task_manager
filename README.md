@@ -83,10 +83,9 @@ The command line carries **mode switches only, never settings**. Settings live i
 `tm_config.yaml`, and there is no way to override the contents of a task list from the
 command line either.
 
-`--root` exists for the test suite, not for daily use. All disk access goes through
-one object, so pointing it elsewhere gives the testbench a throwaway state tree
-instead of dirtying the repo's own `queue/` and `runs/` (`testbench/suite.sh` sets
-`TM_ROOT`). The one real-world case is a repo on a read-only or network filesystem
+`--root` exists for testing, not for daily use. All disk access goes through one
+object, so pointing it elsewhere gives a test a throwaway state tree instead of
+dirtying the repo's own `queue/` and `runs/`. The one real-world case is a repo on a read-only or network filesystem
 that cannot hold the state itself. It is **not** a way to run two queues at once: the
 lock is per root, so two tm processes with different roots each hold their own, see
 the same physical cards, and hand the same GPU to both.

@@ -1,7 +1,5 @@
 __pycache__/
 *.pyc
-testbench/_out/
-testbench/_tmroot/
 
 # tm's runtime state. It lives in the repo directory (not ~/.tm) so it is easy to
 # browse, but it is not code: queue contents, run records, the lock and the pause
@@ -20,5 +18,6 @@ testbench/_tmroot/
 /lists/*
 !/lists/.gitkeep
 
-# Personal lab notes; not published.
+# Local development material; not published.
 /claude_notes/
+/testbench/
