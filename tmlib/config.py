@@ -123,9 +123,12 @@ def resolve(cmd: str, deferred: dict[str, str]) -> str:
 
     Anything else that looks like a placeholder is left exactly as it is. By this
     point substitute() has already rejected undefined `{KEY}`s in the task list; what
-    survives came out of a *var value* (`FMT: "epoch{Epoch}"`), which the shell is
-    meant to receive verbatim. Raising here would kill the scheduler mid-claim, after
-    the list has been moved out of the queue.
+    survives came out of a *var value* (`FMT: "epoch{Epoch}"`). Raising here would
+    kill the scheduler mid-claim, after the list has been moved out of the queue.
+
+    A var value is otherwise part of the command it was spliced into: `{GPU}` in it
+    is expanded and `{{ }}` unescaped like anywhere else, so `DEV: "cuda:{GPU}"`
+    works and a literal brace pair in a value is written `{{ }}` too.
     """
     def repl(m: re.Match[str]) -> str:
         if m.group(0) in ("{{", "}}"):
@@ -259,7 +262,17 @@ def load_plan(path: Path) -> Plan:
     # The yaml file is the only source of vars. There is no command-line override:
     # tm run is a long-lived process and lists are queued at arbitrary times, so
     # "the -v tm started with" and "this list" never line up in time.
-    variables = {str(k): str(v) for k, v in (doc.get("vars") or {}).items()}
+    raw_vars = doc.get("vars") or {}
+    if not isinstance(raw_vars, dict):
+        raise ConfigError(f"{path}: 'vars:' must be a mapping of KEY: value, "
+                          f"got {type(raw_vars).__name__}")
+    for k, v in raw_vars.items():
+        # str() would turn a nested value into its Python repr and splice that into
+        # the command, so only single values get through
+        if isinstance(v, (dict, list)):
+            raise ConfigError(f"{path}: vars.{k} must be a single value, "
+                              f"got {type(v).__name__}")
+    variables = {str(k): str(v) for k, v in raw_vars.items()}
 
     tasks: list[Task] = []
     for i, item in enumerate(raw_tasks, start=1):

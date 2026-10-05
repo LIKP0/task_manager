@@ -54,6 +54,10 @@ TIME_FMT = "%Y-%m-%d %H:%M:%S"
 # anywhere, and .resolve() follows the symlink, so this always points at the repo.
 DEFAULT_ROOT = Path(__file__).resolve().parent.parent
 
+# Queue filenames carry a 3-digit sequence number, and queue order is filename order:
+# '1000_x' sorts before '990_y', so anything past this would land out of order.
+MAX_SEQ = 999
+
 # Terminal run states. Once here, a run is never touched again.
 TERMINAL = {"done", "failed", "lost", "timeout", "aborted", "broken"}
 
@@ -410,6 +414,9 @@ class Store:
         while dst.exists():                 # shift along on collision, never overwrite
             n += 1
             dst = self.queue_dir / f"{n:03d}_{src.stem}{src.suffix}"
+        if not 0 <= n <= MAX_SEQ:
+            raise StoreError(f"sequence number {n} is outside 0-{MAX_SEQ}, so it would "
+                             f"not sort into place; renumber {self.queue_dir} first")
         # Write .tmp then rename. A plain copy has an intermediate state, and a tick
         # could read a half-written yaml. If the truncation lands on a task boundary
         # the result is still valid yaml, just missing steps — tm would silently run

@@ -65,7 +65,7 @@ tm [--root DIR] <subcommand>
 |---|---|---|
 | `--root DIR` | global | Override the state directory (default: the repo). `TM_ROOT` does the same. Mostly test scaffolding — see below |
 | `--once` | `run` | Exit when the queue drains instead of standing by |
-| `--seq N` | `add` | Sequence number; appended to the end by default |
+| `--seq N` | `add` | Sequence number, 0–999; appended to the end by default. Past 999 the filename would no longer sort into place, so `tm add` refuses and asks you to renumber the queue |
 | `-d/--days N` | `prune` | Remove runs that finished more than N days ago (default 30) |
 | `-n/--keep N` | `prune` | Remove all but the newest N finished runs (default 30) |
 
@@ -132,7 +132,7 @@ tasks:
 | `tasks` | **Required**, executed in order |
 | `cwd` | **Required.** The pane's starting directory, and so the base for every relative path in your commands (scripts, configs, output directories). No default: `tm add` copies the list into `queue/`, so anything relative to the yaml itself would drift |
 | `name` | **Required.** Appears in `tm ls`, the run directory name and tmux session names (`tm-<name>-<run id>-01-<task>`, where the run id is the run's start date and time). Never derived from the filename |
-| `vars` | Values for `{KEY}`. No command-line override; fix them here before running |
+| `vars` | Values for `{KEY}`, each a single value (no lists or mappings). A value is spliced into the command and then treated like the rest of it: `{GPU}` expands and `{{ }}` is a literal brace there too. No command-line override; fix them here before running |
 | `wait` | Start conditions, below |
 
 `name` used to be derived from the filename, which also meant stripping the `010_`

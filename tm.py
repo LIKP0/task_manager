@@ -414,7 +414,12 @@ def cmd_add(store: Store, args, st: Style) -> int:
             print(st.red(f"error: {src}: {problem}"), file=sys.stderr)
             rc = 2
             continue
-        dst = store.add(src, seq=args.seq)
+        try:
+            dst = store.add(src, seq=args.seq)
+        except StoreError as exc:
+            print(st.red(f"error: {src}: {exc}"), file=sys.stderr)
+            rc = 2
+            continue
         print(f"queued  {st.cyan(dst.name)}")
         # Sequence numbers only order files that have them. A hand-copied `zzz.yaml`
         # contributes nothing to the numbering, so the new file can land ahead of it
