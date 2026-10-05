@@ -510,10 +510,13 @@ def cmd_attach(store: Store, args, st: Style) -> int:
 
 def cmd_clean(store: Store, args, st: Style) -> int:
     """Remove panes left behind by failures. Running ones are never touched."""
+    # Sessions first, runs second: a step launched after the listing is not a
+    # candidate at all. The other order made every step launched in between a victim.
+    sessions = runner.tm_sessions()
     keep = set()
     for run in store.active():
         keep.update(t.session for t in run.tasks if t.session)
-    victims = [s for s in runner.tm_sessions() if s not in keep]
+    victims = [s for s in sessions if s not in keep]
     if not victims:
         print(st.dim("No sessions to clean up."))
         return 0
