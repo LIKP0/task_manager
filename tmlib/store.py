@@ -428,11 +428,18 @@ class Store:
         return dst
 
     # ---- run directories ------------------------------------------------------
-    def claim(self, queue_path: Path, plan: Plan, gpus: list[int]) -> Run:
+    def claim(self, queue_path: Path, plan: Plan, gpus: list[int],
+              state: str = "running", **fields) -> Run:
         """Turn a queued yaml into a run: make the directory, move the file, write run.yaml.
 
         Move rather than copy, so the queue only ever contains things that have not
         started. You can edit it by hand at any time without touching running work.
+
+        A list skipped at claim time (timed out, failed the device check) passes its
+        terminal `state` here, so run.yaml is written once, already final. Claiming
+        it as running and then calling set_state() left a window where a failed
+        second write meant a running run with no cards — which a restarted tm would
+        launch with no CUDA_VISIBLE_DEVICES, free to use every card.
         """
         self.ensure()
         # Expand commands before anything is created or moved. Everything below this
@@ -458,16 +465,19 @@ class Store:
         run = Run(path)
         run.save(
             name=plan.name,
-            state="running",
+            state=state,
             cwd=str(plan.cwd),
             gpus=list(gpus),
             gpu_budget_gb=plan.wait.gpu_free_gb or 0,
             exclusive=plan.wait.exclusive,
             started=now_stamp(),
-            finished="",
+            finished=now_stamp() if state in TERMINAL else "",
             tasks=records,
+            **fields,
         )
         run.event(f"claimed from {queue_path.name}, gpus={gpus or 'none'}")
+        if state != "running":
+            run.event(f"state -> {state}")
         return run
 
     def runs(self, limit: int | None = None) -> list[Run]:

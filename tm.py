@@ -265,7 +265,7 @@ def _launch(run, idx: int, rec, sess: runner.Session, pool: GpuPool, st: Style) 
 
 
 def _claim(store: Store, path: Path, plan, gpus: list[int], st: Style,
-           complained: dict[Path, str]):
+           complained: dict[Path, str], **final):
     """claim() with the disk failure reported once. None means it did not start.
 
     Every claim path goes through here: a claim touches the filesystem, and an
@@ -280,7 +280,7 @@ def _claim(store: Store, path: Path, plan, gpus: list[int], st: Style,
     the next tick, which is loud rather than silent.
     """
     try:
-        run = store.claim(path, plan, gpus)
+        run = store.claim(path, plan, gpus, **final)
     except OSError as exc:
         if complained.get(path) != "claim":
             complained[path] = "claim"
@@ -327,10 +327,9 @@ def _start_pending(store: Store, pool: GpuPool, st: Style, args,
         if gpus is None:
             first = waiting_since.setdefault(path, now)
             if plan.wait.timeout is not None and now - first >= plan.wait.timeout:
-                run = _claim(store, path, plan, [], st, complained)
+                run = _claim(store, path, plan, [], st, complained, state="timeout")
                 if run is None:
                     continue
-                run.set_state("timeout")
                 waiting_since.pop(path, None)
                 print(st.yellow(f"tm: {plan.name} timed out waiting for a gpu "
                                 f"({plan.wait.timeout:.0f}s), skipping"))
@@ -340,10 +339,10 @@ def _start_pending(store: Store, pool: GpuPool, st: Style, args,
             problems = check_device_settings(plan.tasks, plan.cwd, plan.wait.gpus)
             if problems:
                 # Do not let it retry forever in the queue: move it out and explain
-                run = _claim(store, path, plan, [], st, complained)
+                run = _claim(store, path, plan, [], st, complained,
+                             state="aborted", note="device check failed")
                 if run is None:
                     continue
-                run.set_state("aborted", note="device check failed")
                 print(st.red(f"tm: {plan.name} failed the config device check, skipping:"))
                 for msg in problems:
                     print(st.red(f"  - {msg}"))
