@@ -315,13 +315,18 @@ class Store:
         self.ensure()
         fh = self.lock_path.open("a+")
         try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            # Not ours, so the file is left exactly as the holder wrote it: clearing
+            # it here made `tm ls` report a running tm as not running.
             try:
-                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError as exc:
                 if exc.errno not in (errno.EACCES, errno.EAGAIN):
                     raise
                 fh.seek(0)
                 raise LockBusy(fh.read().strip() or "unknown") from None
+            finally:
+                fh.close()
+        try:
             fh.seek(0)
             fh.truncate()
             fh.write(f"pid {os.getpid()} since {now_stamp()}\n")
