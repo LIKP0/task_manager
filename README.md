@@ -428,7 +428,7 @@ command, reads that yaml, and refuses to start the list if `trainer.devices` is 
 ```
 tm: ddpm_fdg failed the config device check, skipping:
   - task 'train': /home/me/my_project/config/ddpm_fdg.yaml
-      trainer.devices is [1], must be [0] (or 1) — tm assigns the physical card via CUDA_VISIBLE_DEVICES
+      trainer.devices is [1], must be [0] (or 1, -1, auto) — tm assigns the physical card via CUDA_VISIBLE_DEVICES
 ```
 
 Use `{GPU}` when you want the physical index (for logs or output directory names). If

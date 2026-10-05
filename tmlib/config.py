@@ -378,10 +378,13 @@ def _check_one_config(cfg_path: Path, task_name: str, want_list: list[int],
         return []
 
     devices = trainer["devices"]
-    ok = devices == want_list or devices == gpus or (gpus == 1 and devices in (0, [0], "0"))
+    # "auto" and -1 mean every visible card, which under CUDA_VISIBLE_DEVICES is
+    # exactly the cards tm assigned.
+    ok = (devices == want_list or devices == gpus or devices in ("auto", -1, "-1")
+          or (gpus == 1 and devices in (0, [0], "0")))
     if ok:
         return []
     want = f"[{', '.join(str(i) for i in want_list)}]"
     return [f"task '{task_name}': {cfg_path}\n"
-            f"      trainer.devices is {devices!r}, must be {want} (or {gpus}) "
+            f"      trainer.devices is {devices!r}, must be {want} (or {gpus}, -1, auto) "
             f"— tm assigns the physical card via CUDA_VISIBLE_DEVICES"]
