@@ -7,6 +7,8 @@ A task runs only if the previous one exited 0. On failure the list stops there a
 the pane is kept, so you can attach and look around.
 
 Requires `pyyaml` and `tmux`, plus `nvidia-smi` if you use `wait.gpu_free_gb`.
+Tested with Python 3.12.7, PyYAML 6.0.3, tmux 3.2a, bash 5.1.16 and NVIDIA driver
+595.84 on Ubuntu 22.04.
 
 ```bash
 ln -s ~/task_manager/tm.py ~/.local/bin/tm    # install once
@@ -123,7 +125,7 @@ wait:                    # optional: hold until enough GPU is free.
   gpu_index: any         # any | 0 | [0, 1]
   stable_for: 120        # the condition must hold for 120 seconds
 
-cwd: ~/my_project  # required; working directory for every command
+cwd: ~/my_project       # required; working directory for every command
 
 vars:                    # {KEY} placeholders
   CFG: config/ccfm_2p5d_fused_gauss_tsample.yaml
