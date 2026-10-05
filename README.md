@@ -33,16 +33,24 @@ files the tasks write themselves, and all of it lives in the repo directory next
   lock                        single-instance mutex (flock, released on death)
   queue/010_ccfm_c.yaml       here = not started. Copying one in == tm add
   runs/20260808_143301_ccfm_c/
+                              here = in progress
     list.yaml                 the original, moved out of queue/
     run.yaml                  tm's plan: state, cards held, session and final
                               command for each step
     01.sh                     the wrapper script tmux actually executes
     01.rc                     *the exit code the task wrote* — the only evidence
     events.log
+  archive/20260807_090000_ccfm_b/
+                              here = finished; same contents, never touched again
 ```
 
 The central split is **tm writes the plan, the task writes the result**. rc files
 keep appearing after tm dies, and tm has no say in what they contain.
+
+Where a list sits says where it is in its life: `queue/` → `runs/` → `archive/`. tm
+moves a run into `archive/` as soon as it records the final state, so the scheduler
+reads only `runs/` each tick and costs the same however long the history grows. The
+history only takes disk space; `tm prune` clears it when you want.
 
 ## Commands
 
@@ -58,7 +66,7 @@ tm [--root DIR] <subcommand>
 | `tm check F` | Parse without running: see how variables expand and what it will wait for |
 | `tm attach [name]` | Attach to a running task; lists them if there are several |
 | `tm clean [-y]` | Remove tmux sessions left by failures. Lists them unless given `-y` |
-| `tm prune [-d N] [-n N] [-y]` | Delete finished runs from `runs/` past either limit (default 30 days / newest 30). Lists them unless given `-y` |
+| `tm prune [-d N] [-n N] [-y]` | Delete finished runs from `archive/` past either limit (default 30 days / newest 30). Lists them unless given `-y` |
 | `tm hold` / `tm resume` | Pause and resume **queue scanning**, so you can edit it |
 
 | Option | Applies to | What it does |
@@ -343,7 +351,9 @@ Points worth knowing:
 - **Succeed and vanish, fail and stay pinned**: successful sessions exit and leave no
   junk; failed panes keep their full scrollback, and attaching gives an interactive
   shell in the job's cwd and environment (conda is live), so you can debug in place.
-- To reproduce a step, run `bash NN.sh`.
+- To reproduce a step, run `bash NN.sh`. Once the run is in `archive/` the command
+  runs as before, but the script still names its rc file under `runs/`, so that one
+  write fails — a rerun cannot overwrite the evidence of the original run.
 
 tm injects two environment variables: `PYTHONUNBUFFERED=1`, and `CUDA_VISIBLE_DEVICES`
 when a card was acquired.
@@ -359,7 +369,7 @@ no attach:
     | Traceback (most recent call last):
     | FileNotFoundError: no such checkpoint: ...
     still there: tmux attach -t tm-ccfm_c-20260808-143301-02-test
-    /home/me/task_manager/runs/20260808_143301_ccfm_c
+    /home/me/task_manager/archive/20260808_143301_ccfm_c
 ```
 
 Later steps do not run. `tm ls` shows the list as `FAILED  ccfm_c  1/3`. When you are

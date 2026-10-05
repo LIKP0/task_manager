@@ -8,6 +8,7 @@ testbench/_tmroot/
 # flag stay out of version control.
 /queue/
 /runs/
+/archive/
 /lock
 /paused
 /.writable

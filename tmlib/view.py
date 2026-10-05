@@ -91,11 +91,19 @@ def render(store: Store, st: Style, show_all: bool = False) -> list[str]:
     """The complete output of `tm ls`."""
     out: list[str] = []
     sessions = set(runner.list_sessions())
-    # One pass over runs/, partitioned here. Calling active() and runs() separately
-    # parsed every run.yaml twice, and runs/ only shrinks under `tm prune`.
-    everything = store.runs()
-    active = [r for r in everything if not r.done]
-    finished = [r for r in everything if r.done]
+    # runs/ is read before archive/: a run tm archives in between is then dropped by
+    # the first read and found by the second, never missed by both. Keyed by
+    # directory, so one seen in both is listed once. A finished run still in runs/
+    # (tm has not archived it yet) belongs with the history.
+    current = store.current()
+    active = [r for r in current if not r.done]
+    leftover = [r for r in current if r.done]
+    # Only what is shown is read from archive/, so tm ls does not slow down as the
+    # history grows either; the count of what is hidden comes from the listing alone.
+    shown = None if show_all else RECENT_SHOWN
+    by_dir = {r.path.name: r for r in store.archived(shown) + leftover}
+    finished = sorted(by_dir.values(), key=lambda r: r.path.name, reverse=True)[:shown]
+    hidden = max(0, store.archived_count() + len(leftover) - len(finished))
 
     holder = store.lock_holder()
     line = st.bold("tm: ") + (st.green(holder) if holder else st.dim("not running"))
@@ -141,14 +149,12 @@ def render(store: Store, st: Style, show_all: bool = False) -> list[str]:
             out.append(f"  {path.name:<24} {st.red('BAD: ' + str(exc).splitlines()[0])}")
 
     # ---- finished --------------------------------------------------------------
-    # Newest first, capped at RECENT_SHOWN. runs/ is all the history `tm prune` has
-    # left, so the cut is always announced: a list that stops silently hides the run
-    # you were looking for.
-    hidden = 0 if show_all else max(0, len(finished) - RECENT_SHOWN)
+    # Newest first, capped at RECENT_SHOWN. The cut is always announced: a list that
+    # stops silently hides the run you were looking for.
     if finished:
         out.append("")
         out.append(st.bold("RECENT"))
-    for run in finished[:len(finished) - hidden]:
+    for run in finished:
         done, fail_i, fail_rc = run.scan()
         tasks = run.tasks
         mark = {"done": st.green("ok    "), "failed": st.red("FAILED"),

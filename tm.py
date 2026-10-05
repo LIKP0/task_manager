@@ -6,9 +6,9 @@
 
 Every task runs in its own tmux session. tm does three things: scan the queue in
 order, decide what can start, and watch rc files for results. It holds no
-authoritative state of its own; everything is on disk next to tm.py (queue/, runs/),
-so it can be killed and restarted at any time, and you can edit the queue by hand
-while it is not running.
+authoritative state of its own; everything is on disk next to tm.py (queue/, runs/,
+archive/), so it can be killed and restarted at any time, and you can edit the queue
+by hand while it is not running.
 
     tm                    consume task lists from queue/ (run it inside tmux)
     tm ls                 show progress; works whether or not tm is running
@@ -16,7 +16,7 @@ while it is not running.
     tm check list.yaml    parse without running, to see how it expands
     tm attach [name]      attach to a running task
     tm clean              remove tmux sessions left behind by failures
-    tm prune              delete old finished runs from runs/
+    tm prune              delete old finished runs from archive/
     tm hold / tm resume   pause and resume queue scanning, to edit the queue
 
 tm's own settings live in tm_config.yaml, read once at startup. There are no
@@ -86,15 +86,21 @@ def _loop(store: Store, args, st: Style) -> int:
     idle_announced = False
     pause_announced = False
     paused_at: float | None = None
-    # Runs whose directory tm can no longer write. Reported once, then left alone.
+    # Runs whose directory tm can no longer write or move. Reported once, then left
+    # alone.
     stuck: set[Path] = set()
 
     while True:
         pool.refresh()
-        # Read the active runs once. Each call parses every run.yaml under runs/, and
-        # runs/ only shrinks when someone runs `tm prune`, so this is the tick's
-        # dominant cost at any real history size (~0.5s per call at 1000 runs).
-        active = store.active()
+        # runs/ holds only what is in progress — finished runs are moved to archive/
+        # — so this read costs one run.yaml per running list, whatever the history.
+        here = store.current()
+        # A finished run still here was finished by a tm that died before archiving
+        # it, or by one from before archive/ existed. Move it now.
+        for run in here:
+            if run.done and run.path not in stuck:
+                _archive(store, run, st, stuck)
+        active = [r for r in here if not r.done]
         # The allocation table is rebuilt from disk every tick, so a restarted tm
         # never hands out a card someone else already holds. Claims are keyed by run
         # directory, not list name: duplicate list names are allowed, and releasing
@@ -104,7 +110,7 @@ def _loop(store: Store, args, st: Style) -> int:
 
         for run in active:
             if run.path not in stuck:
-                _try_advance(run, pool, st, stuck)
+                _try_advance(store, run, pool, st, stuck)
 
         paused = store.paused()
         if paused:
@@ -170,7 +176,6 @@ def _advance(run, pool: GpuPool, st: Style) -> None:
         run.set_state("broken", note="run.yaml is missing or lists no tasks")
         pool.release(run.gpus, run.path.name)
         print(st.red(f"\n<== {run.name} BROKEN — no run.yaml, or it lists no tasks"))
-        print(st.dim(f"    {run.path}"))
         return
 
     if fail_i is not None:
@@ -181,7 +186,6 @@ def _advance(run, pool: GpuPool, st: Style) -> None:
                      f"({rec.name}) rc={fail_rc}"))
         _print_tail(rec, st)
         print(st.dim(f"    still there: tmux attach -t {rec.session}"))
-        print(st.dim(f"    {run.path}"))
         return
 
     if done >= len(tasks):
@@ -217,8 +221,11 @@ def _advance(run, pool: GpuPool, st: Style) -> None:
         print(st.dim("    session gone with no exit code — hard-killed or the machine rebooted"))
 
 
-def _try_advance(run, pool: GpuPool, st: Style, stuck: set[Path]) -> None:
-    """_advance(), with a run whose directory has gone unwritable set aside."""
+def _try_advance(store: Store, run, pool: GpuPool, st: Style, stuck: set[Path]) -> None:
+    """_advance(), then archive the run if that finished it.
+
+    A run whose directory has gone unwritable is set aside instead.
+    """
     try:
         _advance(run, pool, st)
     except OSError as exc:
@@ -232,6 +239,25 @@ def _try_advance(run, pool: GpuPool, st: Style, stuck: set[Path]) -> None:
         print(st.dim(f"    {run.path}"))
         print(st.dim("    its gpus stay reserved; fix the directory and "
                      "restart tm to pick it up again"))
+        return
+    # Where to look is printed once it is archived, so the path is the one that lasts
+    if run.done and _archive(store, run, st, stuck) and run.state != "done":
+        print(st.dim(f"    {run.path}"))
+
+
+def _archive(store: Store, run, st: Style, stuck: set[Path]) -> bool:
+    """Move a finished run into archive/. False if it stays in runs/ for now."""
+    try:
+        store.archive(run)
+    except OSError as exc:
+        # Already finished and its cards released, so staying in runs/ costs one
+        # run.yaml read per tick and nothing else. Report once; a restarted tm
+        # tries again.
+        stuck.add(run.path)
+        print(st.red(f"tm: cannot archive {run.name}: {exc}"))
+        print(st.dim(f"    {run.path} stays in runs/; fix it and restart tm to move it"))
+        return False
+    return True
 
 
 def _print_tail(rec, st: Style, lines: int = 12) -> None:
@@ -330,6 +356,7 @@ def _start_pending(store: Store, pool: GpuPool, st: Style, args,
                 run = _claim(store, path, plan, [], st, complained, state="timeout")
                 if run is None:
                     continue
+                _archive(store, run, st, stuck)
                 waiting_since.pop(path, None)
                 print(st.yellow(f"tm: {plan.name} timed out waiting for a gpu "
                                 f"({plan.wait.timeout:.0f}s), skipping"))
@@ -343,6 +370,7 @@ def _start_pending(store: Store, pool: GpuPool, st: Style, args,
                              state="aborted", note="device check failed")
                 if run is None:
                     continue
+                _archive(store, run, st, stuck)
                 print(st.red(f"tm: {plan.name} failed the config device check, skipping:"))
                 for msg in problems:
                     print(st.red(f"  - {msg}"))
@@ -358,7 +386,7 @@ def _start_pending(store: Store, pool: GpuPool, st: Style, args,
         waiting_since.pop(path, None)
         where = ",".join(f"gpu{g}" for g in gpus) or "no gpu"
         print(st.bold(f"\ntm: start {plan.name} on {where}  ({len(plan.tasks)} tasks)"))
-        _try_advance(run, pool, st, stuck)
+        _try_advance(store, run, pool, st, stuck)
 
 
 # --------------------------------------------------------------------------- #
@@ -503,14 +531,15 @@ def cmd_clean(store: Store, args, st: Style) -> int:
 
 
 def cmd_prune(store: Store, args, st: Style) -> int:
-    """Delete finished runs past either limit. Running ones are never touched.
+    """Delete archived runs past either limit. Only archive/ is touched, so nothing
+    in progress can be.
 
     Count and age are both caps: a run goes once it falls outside the newest --keep,
     or once it finished more than --days ago. Newest first by start time, the same
     order `tm ls` lists them in, so the runs kept are the ones it shows at the top.
     """
     cutoff = datetime.now() - timedelta(days=args.days)
-    finished = [r for r in store.runs() if r.done]
+    finished = store.archived()
     victims = [r for i, r in enumerate(finished)
                if i >= args.keep or _finished_before(r, cutoff)]
     if not victims:
@@ -627,10 +656,10 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     st = Style()
     store = Store(args.root)
-    # Every command creates queue/ and runs/ first. Creating them lazily means a repo
-    # that has never run tm has no queue directory to look at, while the README and
-    # tm ls both tell you to copy a yaml into it. Failures are not reported here;
-    # cmd_run's check_writable() gives a more accurate message.
+    # Every command creates queue/, runs/ and archive/ first. Creating them lazily
+    # means a repo that has never run tm has no queue directory to look at, while the
+    # README and tm ls both tell you to copy a yaml into it. Failures are not reported
+    # here; cmd_run's check_writable() gives a more accurate message.
     try:
         store.ensure()
     except OSError:

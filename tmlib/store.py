@@ -12,12 +12,19 @@ not running.
         010_ccfm_c.yaml             here = not started. Copying one in == `tm add`
         020_ccfm_d.yaml
       runs/
-        20260808_143022_ccfm_c/
+        20260808_143022_ccfm_c/     here = in progress. Moved out of queue/ at start
           list.yaml                 the original, moved out of queue/
           run.yaml                  written by tm: state, GPUs held, session names
           01.rc  02.rc              exit codes written by the tasks themselves —
                                     the only evidence a step finished
           events.log                a human-readable log
+      archive/
+        20260807_090000_ccfm_b/     here = finished. Moved out of runs/ by tm once it
+                                    records the final state; never touched again
+
+The directory a list sits in says where it is in its life: queue/, runs/, archive/.
+That keeps the scheduler's per-tick read to runs/, so it costs the same however long
+the history is.
 
 The key split: `run.yaml` is the plan, written by tm. `NN.rc` is the result, written
 by the task. rc files keep appearing after tm dies, and tm does not get a say in what
@@ -275,10 +282,12 @@ class Store:
         self.root = Path(root or os.environ.get("TM_ROOT") or DEFAULT_ROOT).expanduser()
         self.queue_dir = self.root / "queue"
         self.runs_dir = self.root / "runs"
+        self.archive_dir = self.root / "archive"
 
     def ensure(self) -> None:
         self.queue_dir.mkdir(parents=True, exist_ok=True)
         self.runs_dir.mkdir(parents=True, exist_ok=True)
+        self.archive_dir.mkdir(parents=True, exist_ok=True)
 
     def check_writable(self) -> None:
         """Confirm we can write to disk before starting anything.
@@ -300,7 +309,7 @@ class Store:
             # sends you looking in the wrong place.
             raise StoreError(f"cannot create the state directories under "
                              f"{self.root}: {exc}") from exc
-        for d in (self.root, self.queue_dir, self.runs_dir):
+        for d in (self.root, self.queue_dir, self.runs_dir, self.archive_dir):
             probe = d / ".writable"
             try:
                 probe.write_text("ok")
@@ -452,7 +461,9 @@ class Store:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = self.runs_dir / f"{stamp}_{plan.name}"
         n = 1
-        while path.exists():                # two starts within the same second
+        # Two starts within the same second. archive/ counts too: a name taken there
+        # would stop this run from being archived when it finishes.
+        while path.exists() or (self.archive_dir / path.name).exists():
             n += 1
             path = self.runs_dir / f"{stamp}_{plan.name}.{n}"
         path.mkdir(parents=True)
@@ -480,36 +491,57 @@ class Store:
             run.event(f"state -> {state}")
         return run
 
-    def runs(self, limit: int | None = None) -> list[Run]:
-        """All runs, newest first."""
-        if not self.runs_dir.is_dir():
+    def _load(self, d: Path, limit: int | None = None) -> list[Run]:
+        """The runs under d, newest first. Only the first `limit` are read."""
+        if not d.is_dir():
             return []
-        paths = sorted((p for p in self.runs_dir.iterdir() if p.is_dir()), reverse=True)
-        if limit is not None:
-            paths = paths[:limit]
-        # `tm prune` can rename a directory out between the listing and the read. Its
-        # run.yaml then reads as missing — a running list with no tasks — and tm would
-        # try to mark it broken. Checked after the read, so a rename cannot slip between.
+        paths = sorted((p for p in d.iterdir() if p.is_dir()), reverse=True)[:limit]
+        # A directory can leave between the listing and the read: tm archives finished
+        # runs, and `tm prune` deletes archived ones. Its run.yaml then reads as
+        # missing — a running list with no tasks. Checked after the read, so a move
+        # cannot slip between.
         return [r for r in (Run(p) for p in paths) if r.path.is_dir()]
 
+    def current(self) -> list[Run]:
+        """Everything in runs/: the runs in progress, plus any finished run that has
+        not been archived yet (a tm died in between). Normally a handful."""
+        return self._load(self.runs_dir)
+
     def active(self) -> list[Run]:
-        """Runs not yet in a terminal state. Normally a handful, one per card."""
-        return [r for r in self.runs() if not r.done]
+        """Runs not yet in a terminal state."""
+        return [r for r in self.current() if not r.done]
+
+    def archived(self, limit: int | None = None) -> list[Run]:
+        """Finished runs, newest first. Only the first `limit` are read."""
+        return self._load(self.archive_dir, limit)
+
+    def archived_count(self) -> int:
+        if not self.archive_dir.is_dir():
+            return 0
+        return sum(1 for p in self.archive_dir.iterdir() if p.is_dir())
+
+    def archive(self, run: Run) -> None:
+        """Move a finished run into archive/, out of every later tick's read.
+
+        One rename, and the directory keeps its name, so the run id and the session
+        names derived from it stay the same.
+        """
+        target = self.archive_dir / run.path.name
+        run.path.rename(target)
+        run.path = target
 
     def remove(self, run: Run) -> None:
-        """Delete a finished run's directory. Running ones are refused.
+        """Delete an archived run's directory. Anything else is refused.
 
-        Renamed out of runs/ first, so the directory leaves runs/ in one step and
-        runs() never yields it half-deleted. Deleted in place, it would lose run.yaml
-        while still listed, read as a running list with no tasks, and tm would mark it
-        broken — writing a fresh run.yaml into the directory being deleted.
+        Renamed out of archive/ first, so `tm ls` never reads it half-deleted.
+        Deleted in place, it would lose run.yaml while still listed and show up as a
+        run that never started.
         """
-        run.reload()
-        if not run.done:
-            raise StoreError(f"{run.path.name} has not finished")
+        if run.path.parent != self.archive_dir:
+            raise StoreError(f"{run.path.name} is not in {self.archive_dir}")
         trash = self.root / ".pruning"
         trash.mkdir(exist_ok=True)
-        # Anything already here is out of runs/ and left by a delete that failed
+        # Anything already here is out of archive/ and left by a delete that failed
         # part-way. Nothing else will ever finish it, so do that before touching this
         # run; if it fails again, the error names the leftover and this run is intact.
         for left in list(trash.iterdir()):
