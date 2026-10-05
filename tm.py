@@ -303,7 +303,9 @@ def _claim(store: Store, path: Path, plan, gpus: list[int], st: Style,
     directory holding only list.yaml. That is deliberate — the alternative ordering
     would leave the file queued *and* a complete run.yaml behind it, and the next
     tick would start the same list twice. The leftover is picked up as `broken` on
-    the next tick, which is loud rather than silent.
+    the next tick, which is loud rather than silent. A skipped list's leftover is
+    already in archive/, where nothing picks it up; it holds no cards and
+    `tm prune` clears it like any other record.
     """
     try:
         run = store.claim(path, plan, gpus, **final)
@@ -353,10 +355,8 @@ def _start_pending(store: Store, pool: GpuPool, st: Style, args,
         if gpus is None:
             first = waiting_since.setdefault(path, now)
             if plan.wait.timeout is not None and now - first >= plan.wait.timeout:
-                run = _claim(store, path, plan, [], st, complained, state="timeout")
-                if run is None:
+                if _claim(store, path, plan, [], st, complained, state="timeout") is None:
                     continue
-                _archive(store, run, st, stuck)
                 waiting_since.pop(path, None)
                 print(st.yellow(f"tm: {plan.name} timed out waiting for a gpu "
                                 f"({plan.wait.timeout:.0f}s), skipping"))
@@ -366,11 +366,9 @@ def _start_pending(store: Store, pool: GpuPool, st: Style, args,
             problems = check_device_settings(plan.tasks, plan.cwd, plan.wait.gpus)
             if problems:
                 # Do not let it retry forever in the queue: move it out and explain
-                run = _claim(store, path, plan, [], st, complained,
-                             state="aborted", note="device check failed")
-                if run is None:
+                if _claim(store, path, plan, [], st, complained,
+                          state="aborted", note="device check failed") is None:
                     continue
-                _archive(store, run, st, stuck)
                 print(st.red(f"tm: {plan.name} failed the config device check, skipping:"))
                 for msg in problems:
                     print(st.red(f"  - {msg}"))

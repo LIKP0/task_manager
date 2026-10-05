@@ -448,7 +448,8 @@ class Store:
         terminal `state` here, so run.yaml is written once, already final. Claiming
         it as running and then calling set_state() left a window where a failed
         second write meant a running run with no cards — which a restarted tm would
-        launch with no CUDA_VISIBLE_DEVICES, free to use every card.
+        launch with no CUDA_VISIBLE_DEVICES, free to use every card. Such a run never
+        starts, so its directory is made in archive/ rather than passing through runs/.
         """
         self.ensure()
         # Expand commands before anything is created or moved. Everything below this
@@ -459,13 +460,14 @@ class Store:
                    for t in plan.tasks]
 
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = self.runs_dir / f"{stamp}_{plan.name}"
+        parent = self.archive_dir if state in TERMINAL else self.runs_dir
+        path = parent / f"{stamp}_{plan.name}"
         n = 1
-        # Two starts within the same second. archive/ counts too: a name taken there
-        # would stop this run from being archived when it finishes.
-        while path.exists() or (self.archive_dir / path.name).exists():
+        # Two starts within the same second. Both directories count: the same name in
+        # runs/ and archive/ would stop the one in runs/ from being archived.
+        while (self.runs_dir / path.name).exists() or (self.archive_dir / path.name).exists():
             n += 1
-            path = self.runs_dir / f"{stamp}_{plan.name}.{n}"
+            path = parent / f"{stamp}_{plan.name}.{n}"
         path.mkdir(parents=True)
 
         shutil.move(str(queue_path), str(path / "list.yaml"))
