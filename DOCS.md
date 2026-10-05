@@ -1,14 +1,13 @@
-# tm
+# tm — technical reference
+
+How tm behaves and why: every command, every key, every rule. For installing and a
+first run, see the [README](README.md).
 
 Queue up task lists and start them when a GPU frees up. Every task runs in its own
 tmux session.
 
 A task runs only if the previous one exited 0. On failure the list stops there and
 the pane is kept, so you can attach and look around.
-
-Requires `pyyaml` and `tmux`, plus `nvidia-smi` if you use `wait.gpu_free_gb`.
-Tested with Python 3.12.7, PyYAML 6.0.3, tmux 3.2a, bash 5.1.16 and NVIDIA driver
-595.84 on Ubuntu 22.04.
 
 ```bash
 ln -s ~/task_manager/tm.py ~/.local/bin/tm    # install once
