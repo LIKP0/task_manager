@@ -127,7 +127,11 @@ def write_script(path: Path, cmd: str, cwd: Path, rc_file: Path, label: str) -> 
         # (or ends in `exec`) takes the wrapper with it, the rc file is never
         # written, and tm reads an ordinary failure as "no evidence = LOST".
         # The subshell contains the exit; $? is still the real value.
-        f"( {cmd} )",
+        # The parens get lines of their own: on one line, a trailing `# comment` in
+        # cmd would comment out the `)` and the whole script would fail to parse.
+        "(",
+        cmd,
+        ")",
         "rc=$?",
         "",
         # Write a temp file, then rename. rename is atomic, so the rc file is either
