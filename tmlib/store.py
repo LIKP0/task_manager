@@ -465,11 +465,37 @@ class Store:
         paths = sorted((p for p in self.runs_dir.iterdir() if p.is_dir()), reverse=True)
         if limit is not None:
             paths = paths[:limit]
-        return [Run(p) for p in paths]
+        # `tm prune` can rename a directory out between the listing and the read. Its
+        # run.yaml then reads as missing — a running list with no tasks — and tm would
+        # try to mark it broken. Checked after the read, so a rename cannot slip between.
+        return [r for r in (Run(p) for p in paths) if r.path.is_dir()]
 
     def active(self) -> list[Run]:
         """Runs not yet in a terminal state. Normally a handful, one per card."""
         return [r for r in self.runs() if not r.done]
+
+    def remove(self, run: Run) -> None:
+        """Delete a finished run's directory. Running ones are refused.
+
+        Renamed out of runs/ first, so the directory leaves runs/ in one step and
+        runs() never yields it half-deleted. Deleted in place, it would lose run.yaml
+        while still listed, read as a running list with no tasks, and tm would mark it
+        broken — writing a fresh run.yaml into the directory being deleted.
+        """
+        run.reload()
+        if not run.done:
+            raise StoreError(f"{run.path.name} has not finished")
+        trash = self.root / ".pruning"
+        trash.mkdir(exist_ok=True)
+        # Anything already here is out of runs/ and left by a delete that failed
+        # part-way. Nothing else will ever finish it, so do that before touching this
+        # run; if it fails again, the error names the leftover and this run is intact.
+        for left in list(trash.iterdir()):
+            shutil.rmtree(left)
+        target = trash / run.path.name
+        run.path.rename(target)
+        shutil.rmtree(target)
+        trash.rmdir()
 
 
 def now_stamp() -> str:

@@ -11,6 +11,7 @@ testbench/_tmroot/
 /lock
 /paused
 /.writable
+/.pruning/
 
 # Your own task lists. The directory is kept via .gitkeep, the contents are not
 # tracked: experiment lists change constantly and do not belong in the tool's

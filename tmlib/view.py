@@ -92,7 +92,7 @@ def render(store: Store, st: Style, show_all: bool = False) -> list[str]:
     out: list[str] = []
     sessions = set(runner.list_sessions())
     # One pass over runs/, partitioned here. Calling active() and runs() separately
-    # parsed every run.yaml twice, and runs/ is never pruned.
+    # parsed every run.yaml twice, and runs/ only shrinks under `tm prune`.
     everything = store.runs()
     active = [r for r in everything if not r.done]
     finished = [r for r in everything if r.done]
@@ -141,8 +141,9 @@ def render(store: Store, st: Style, show_all: bool = False) -> list[str]:
             out.append(f"  {path.name:<24} {st.red('BAD: ' + str(exc).splitlines()[0])}")
 
     # ---- finished --------------------------------------------------------------
-    # Newest first, capped at RECENT_SHOWN. runs/ is the whole history, so the cut is
-    # always announced: a list that stops silently hides the run you were looking for.
+    # Newest first, capped at RECENT_SHOWN. runs/ is all the history `tm prune` has
+    # left, so the cut is always announced: a list that stops silently hides the run
+    # you were looking for.
     hidden = 0 if show_all else max(0, len(finished) - RECENT_SHOWN)
     if finished:
         out.append("")

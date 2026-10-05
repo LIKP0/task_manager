@@ -58,6 +58,7 @@ tm [--root DIR] <subcommand>
 | `tm check F` | Parse without running: see how variables expand and what it will wait for |
 | `tm attach [name]` | Attach to a running task; lists them if there are several |
 | `tm clean [-y]` | Remove tmux sessions left by failures. Lists them unless given `-y` |
+| `tm prune [-d N] [-n N] [-y]` | Delete finished runs from `runs/` past either limit (default 30 days / newest 30). Lists them unless given `-y` |
 | `tm hold` / `tm resume` | Pause and resume **queue scanning**, so you can edit it |
 
 | Option | Applies to | What it does |
@@ -65,6 +66,8 @@ tm [--root DIR] <subcommand>
 | `--root DIR` | global | Override the state directory (default: the repo). `TM_ROOT` does the same. Mostly test scaffolding — see below |
 | `--once` | `run` | Exit when the queue drains instead of standing by |
 | `--seq N` | `add` | Sequence number; appended to the end by default |
+| `-d/--days N` | `prune` | Remove runs that finished more than N days ago (default 30) |
+| `-n/--keep N` | `prune` | Remove all but the newest N finished runs (default 30) |
 
 The command line carries **mode switches only, never settings**. Settings live in
 `tm_config.yaml`, and there is no way to override the contents of a task list from the

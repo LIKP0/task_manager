@@ -16,6 +16,7 @@ while it is not running.
     tm check list.yaml    parse without running, to see how it expands
     tm attach [name]      attach to a running task
     tm clean              remove tmux sessions left behind by failures
+    tm prune              delete old finished runs from runs/
     tm hold / tm resume   pause and resume queue scanning, to edit the queue
 
 tm's own settings live in tm_config.yaml, read once at startup. There are no
@@ -32,6 +33,7 @@ import argparse
 import os
 import sys
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from tmlib import runner
@@ -39,7 +41,8 @@ from tmlib.config import (ConfigError, check_device_settings, load_plan,
                           unescape_braces)
 from tmlib.gpu import Gpu, GpuPool, capacity_problem, query_gpus
 from tmlib.settings import Settings, config_path, load_settings
-from tmlib.store import LockBusy, Store, StoreError, now_stamp as store_now
+from tmlib.store import (TIME_FMT, LockBusy, Store, StoreError,
+                         now_stamp as store_now)
 from tmlib.view import Style, describe_wait, render
 
 
@@ -89,8 +92,8 @@ def _loop(store: Store, args, st: Style) -> int:
     while True:
         pool.refresh()
         # Read the active runs once. Each call parses every run.yaml under runs/, and
-        # runs/ is never pruned, so this is the tick's dominant cost at any real
-        # history size (~0.5s per call at 1000 runs).
+        # runs/ only shrinks when someone runs `tm prune`, so this is the tick's
+        # dominant cost at any real history size (~0.5s per call at 1000 runs).
         active = store.active()
         # The allocation table is rebuilt from disk every tick, so a restarted tm
         # never hands out a card someone else already holds. Claims are keyed by run
@@ -492,6 +495,56 @@ def cmd_clean(store: Store, args, st: Style) -> int:
     return 0
 
 
+def cmd_prune(store: Store, args, st: Style) -> int:
+    """Delete finished runs past either limit. Running ones are never touched.
+
+    Count and age are both caps: a run goes once it falls outside the newest --keep,
+    or once it finished more than --days ago. Newest first by start time, the same
+    order `tm ls` lists them in, so the runs kept are the ones it shows at the top.
+    """
+    cutoff = datetime.now() - timedelta(days=args.days)
+    finished = [r for r in store.runs() if r.done]
+    victims = [r for i, r in enumerate(finished)
+               if i >= args.keep or _finished_before(r, cutoff)]
+    if not victims:
+        print(st.dim("No runs to prune."))
+        return 0
+    rc = 0
+    for run in victims:
+        ended = run.finished or "?"
+        what = f"{run.path.name}  " + st.dim(f"{run.state}, finished {ended}")
+        if not args.yes:
+            print(f"  would remove  {what}")
+            continue
+        try:
+            store.remove(run)
+        except (OSError, StoreError) as exc:
+            print(st.red(f"  cannot remove {run.path.name}: {exc}"))
+            rc = 1
+            continue
+        print(f"  removed  {what}")
+    if not args.yes:
+        print(st.dim(f"add -y to actually do it ({len(victims)} of {len(finished)} "
+                     f"finished run(s); keeping the newest {args.keep}, "
+                     f"none older than {args.days} days)"))
+    return rc
+
+
+def _finished_before(run, cutoff: datetime) -> bool:
+    # An unreadable stamp never ages a run out; the count limit still applies to it
+    try:
+        return datetime.strptime(run.finished, TIME_FMT) < cutoff
+    except ValueError:
+        return False
+
+
+def _count(text: str) -> int:
+    n = int(text)
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"must be 0 or more, got {n}")
+    return n
+
+
 def cmd_hold(store: Store, args, st: Style) -> int:
     """Hold the queue so you can reorder it safely.
 
@@ -552,6 +605,15 @@ def main(argv: list[str] | None = None) -> int:
     clean = sub.add_parser("clean", help="remove tmux sessions left by failures")
     clean.add_argument("-y", "--yes", action="store_true", help="actually do it")
 
+    prune = sub.add_parser("prune", help="delete finished runs past the age or count limit")
+    prune.add_argument("-d", "--days", type=_count, default=30,
+                       help="remove runs that finished more than this many days ago "
+                            "(default 30)")
+    prune.add_argument("-n", "--keep", type=_count, default=30,
+                       help="remove all but the newest this many finished runs "
+                            "(default 30)")
+    prune.add_argument("-y", "--yes", action="store_true", help="actually do it")
+
     sub.add_parser("hold", help="pause: start nothing new, so you can edit the queue")
     sub.add_parser("resume", help="undo hold")
 
@@ -578,7 +640,7 @@ def main(argv: list[str] | None = None) -> int:
 
     handlers = {None: cmd_run, "run": cmd_run, "ls": cmd_ls, "add": cmd_add,
                 "check": cmd_check, "attach": cmd_attach, "clean": cmd_clean,
-                "hold": cmd_hold, "resume": cmd_resume}
+                "prune": cmd_prune, "hold": cmd_hold, "resume": cmd_resume}
     if args.cmd is None and not hasattr(args, "once"):
         args.once = False           # bare `tm` means `tm run`
 
