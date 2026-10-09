@@ -49,7 +49,7 @@ from pathlib import Path
 
 import yaml
 
-from .config import Plan, SafeLoader, resolve
+from .config import NowSpec, Plan, SafeLoader, resolve
 
 # The on-disk timestamp format. Written here and by tm.py, read back by view.py —
 # one constant so a change cannot half-land (view._elapsed swallows a parse failure
@@ -146,6 +146,11 @@ class Run:
         # A missing key means an old run (from before exclusive existed); treating it
         # as exclusive is what keeps it from being crowded out.
         return bool(self._doc.get("exclusive", True))
+
+    @property
+    def start(self) -> str:
+        """'wait' or 'now', as the list asked; '' for a run from before now: existed."""
+        return str(self._doc.get("start") or "")
 
     @property
     def started(self) -> str:
@@ -481,8 +486,9 @@ class Store:
             state=state,
             cwd=str(plan.cwd),
             gpus=list(gpus),
-            gpu_budget_gb=plan.wait.gpu_free_gb or 0,
-            exclusive=plan.wait.exclusive,
+            gpu_budget_gb=plan.start.gpu_free_gb,
+            exclusive=plan.start.exclusive,
+            start="now" if isinstance(plan.start, NowSpec) else "wait",
             started=now_stamp(),
             finished=now_stamp() if state in TERMINAL else "",
             tasks=records,

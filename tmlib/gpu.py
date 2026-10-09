@@ -29,6 +29,10 @@ The second is not optional. Right after tm starts A, A is still importing torch 
 nvidia-smi shows the card as empty; going by the measured value alone lets B in, and
 both OOM once their memory pools are built. How much A intends to use is something
 tm already knows, and known facts should not be guessed at by sampling.
+
+A `now:` list is outside the queue rule. It goes straight onto the cards it names,
+past reserved, stable_for and exclusive claims, and only those two VRAM tests can
+stop it (room_now()). Its own claim is exclusive, so waiting lists keep off.
 """
 
 from __future__ import annotations
@@ -38,7 +42,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
-from .config import MAX_STABLE_FOR, ConfigError, WaitSpec
+from .config import MAX_STABLE_FOR, ConfigError, NowSpec, WaitSpec
 
 # MiB is nvidia-smi's unit, so the conversion lives here. Callers speak GiB only.
 MIB_PER_GIB = 1024
@@ -93,17 +97,17 @@ def query_gpus() -> list[Gpu]:
     return gpus
 
 
-def _need_mib(spec: WaitSpec) -> int:
+def _need_mib(spec: WaitSpec | NowSpec) -> int:
     """The per-card VRAM a spec asks for, in nvidia-smi's unit."""
     return int(spec.gpu_free_gb * MIB_PER_GIB)
 
 
-def _in_scope(g: Gpu, spec: WaitSpec) -> bool:
+def _in_scope(g: Gpu, spec: WaitSpec | NowSpec) -> bool:
     """Does `gpu_index` allow this card at all? (None means any.)"""
     return spec.gpu_index is None or g.index in spec.gpu_index
 
 
-def capacity_problem(spec: WaitSpec, gpus: list[Gpu]) -> str | None:
+def capacity_problem(spec: WaitSpec | NowSpec, gpus: list[Gpu]) -> str | None:
     """Could this request ever be filled, with every card on the machine idle?
 
     pick() cannot tell "the cards are busy" from "no card is that big" — both are
@@ -119,7 +123,7 @@ def capacity_problem(spec: WaitSpec, gpus: list[Gpu]) -> str | None:
     than reporting zero cards — so it answers None. Every caller reaches that state by
     a query that failed, and none of them wants a verdict from a failed query.
     """
-    if not spec.manages_gpu or not gpus:
+    if not spec.gpus or not gpus:
         return None
     need_mib = _need_mib(spec)
     candidates = [g for g in gpus if _in_scope(g, spec)]
@@ -127,13 +131,13 @@ def capacity_problem(spec: WaitSpec, gpus: list[Gpu]) -> str | None:
     if len(fits) >= spec.gpus:
         return None
 
-    # Same spelling of a card list as describe_wait(), which `tm check` prints three
+    # Same spelling of a card list as describe_start(), which `tm check` prints three
     # lines above this message.
     scope = ("" if spec.gpu_index is None
              else " within gpu " + ",".join(map(str, spec.gpu_index)))
     if len(fits) == len(candidates):
         # Every eligible card is big enough; there are simply too few of them.
-        why = f"gpus: {spec.gpus}, but this machine has {len(candidates)} card(s){scope}"
+        why = f"needs {spec.gpus} card(s){scope}, but this machine has {len(candidates)}"
     else:
         sizes = ", ".join(f"gpu{g.index}: {g.total_gib:.1f} GiB" for g in candidates)
         why = (f"gpu_free_gb: {spec.gpu_free_gb:.1f} is per card and needs "
@@ -211,12 +215,9 @@ class GpuPool:
     def pick(self, spec: WaitSpec) -> list[int] | None:
         """Can this list start now? Returns the card indices, or None.
 
-        An empty list means "no GPU needed, run immediately". When the request cannot
-        be filled, the free cards it could have used go into reserved, blocking
-        lower-priority lists for the rest of this tick.
+        When the request cannot be filled, the free cards it could have used go into
+        reserved, blocking lower-priority lists for the rest of this tick.
         """
-        if not spec.manages_gpu:
-            return []
         if self.error:
             return None
 
@@ -238,6 +239,31 @@ class GpuPool:
         self._reserved |= {g.index for g in eligible
                            if self._history[g.index].free_now(need_mib)}
         return None
+
+    def room_now(self, spec: NowSpec) -> str | None:
+        """Why a `now:` list cannot go on its cards this tick, or None if it can.
+
+        Exclusive claims, stable_for and reserved are skipped: they are agreements
+        between waiting lists, and `now:` overrides them. Both VRAM tests from the
+        module docstring stay, for the same reason as sharing — a tm run that has
+        just started looks empty to nvidia-smi, but its budget is on record here.
+        Call only after refresh() succeeded.
+        """
+        need_mib = _need_mib(spec)
+        cards = {g.index: g for g in self.gpus}
+        short = []
+        for i in spec.gpu_index:
+            g = cards.get(i)
+            if g is None:
+                short.append(f"gpu{i} does not exist")
+                continue
+            unbooked = g.total_mib - sum(budget for _, budget, _ in self.claims.get(i, []))
+            if min(g.free_mib, unbooked) < need_mib:
+                short.append(f"gpu{i} has {g.free_gib:.1f} GiB free and "
+                             f"{unbooked / MIB_PER_GIB:.1f} GiB not booked by tm runs")
+        if not short:
+            return None
+        return f"needs {spec.gpu_free_gb:.1f} GiB per card, but " + "; ".join(short)
 
     # ---- allocation table ------------------------------------------------------
     def _can_join(self, g: Gpu, need_mib: int, exclusive: bool) -> bool:

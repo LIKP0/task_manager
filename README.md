@@ -55,7 +55,7 @@ Write a list, say `lists/unet.yaml` (`lists/` is gitignored;
 name: unet_base
 cwd: ~/my_project               # every command runs here
 
-wait:                           # omit to start right away, without a GPU
+wait:                           # or now: to skip the queue, see below
   gpu_free_gb: 40               # one card with 40 GiB free
   stable_for: 120               # for two minutes straight
 
@@ -84,6 +84,19 @@ Two things to know before the first run:
   Write `devices: [0]` or `auto` in configs, never a physical index; tm refuses lists
   that get this wrong.
 - Start tmux and tm from the conda env your jobs need.
+
+To run something beside the queue rather than in it — a baseline next to a training
+job, or a CPU job — write `now:` instead of `wait:`:
+
+```yaml
+now:                # start on gpu1 as soon as tm sees it, ignoring exclusive and queue order
+  gpu_index: 1
+  gpu_free_gb: 20   # refused (not queued) if gpu1 lacks this much right now
+
+now: cpu            # or: no card at all
+```
+
+A list must have exactly one of the two. See "Starting now" in `DOCS.md`.
 
 ## Everyday use
 
@@ -121,7 +134,7 @@ write a task list, tm check it, tm add it. Quick smoke tests run directly.
 | To change | Edit |
 |---|---|
 | Poll interval, the device check | `tm_config.yaml` (`poll`, `device_check`); restart tm to apply |
-| When a list may start | Its `wait:` block: `gpu_free_gb`, `gpus`, `gpu_index`, `stable_for`, `timeout`, `exclusive` |
+| When a list may start | Exactly one of `wait:` (`gpu_free_gb`, `gpus`, `gpu_index`, `stable_for`, `timeout`, `exclusive`) and `now:` (`gpu_index`, `gpu_free_gb`, or `cpu`) |
 | History kept | `tm prune -d DAYS -n COUNT` |
 | Silence warning (30 min), finished runs shown (10) | `SILENT_WARN`, `RECENT_SHOWN` in `tmlib/view.py` |
 

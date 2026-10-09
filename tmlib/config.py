@@ -52,18 +52,36 @@ class Task:
 
 @dataclass
 class WaitSpec:
-    """Start conditions. No gpu_free_gb means GPUs are ignored and the list starts at once."""
+    """`wait:` — queue until tm finds cards with enough VRAM, stable for a while."""
 
-    gpu_free_gb: float | None = None
+    gpu_free_gb: float = 0.0             # required; the parser refuses a wait without it
     gpus: int = 1
     gpu_index: list[int] | None = None   # None means any
     stable_for: float = 120.0            # seconds
     timeout: float | None = None         # seconds; give up on this list after waiting
     exclusive: bool = True               # no second tm run may share the card
 
+
+@dataclass
+class NowSpec:
+    """`now:` — start at once on the cards named. No cards means `now: cpu`.
+
+    Only VRAM can stop it. Exclusive claims, stable_for and the queue's reservations
+    are agreements between waiting lists, and `now:` is you overriding them.
+    """
+
+    gpu_index: list[int] = field(default_factory=list)
+    gpu_free_gb: float = 0.0
+
     @property
-    def manages_gpu(self) -> bool:
-        return self.gpu_free_gb is not None
+    def gpus(self) -> int:
+        return len(self.gpu_index)
+
+    @property
+    def exclusive(self) -> bool:
+        # Its own claim keeps waiting lists off its cards. It sits there because you
+        # put it there, and tm has no way to know what it would tolerate beside it.
+        return True
 
 
 @dataclass
@@ -71,7 +89,7 @@ class Plan:
     tasks: list[Task]
     cwd: Path
     name: str
-    wait: WaitSpec = field(default_factory=WaitSpec)
+    start: WaitSpec | NowSpec
 
 
 # --------------------------------------------------------------------------- #
@@ -139,20 +157,100 @@ def resolve(cmd: str, deferred: dict[str, str]) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# The wait: block
+# How a list starts: the wait: or now: block
 # --------------------------------------------------------------------------- #
+
+_START_HELP = (
+    "      wait: {gpu_free_gb: 40}               queue until a card has 40 GiB free\n"
+    "      now: {gpu_index: 1, gpu_free_gb: 20}  start at once on gpu1\n"
+    "      now: cpu                              start at once, with no GPU")
+
+
+def _parse_start(doc: dict, path: Path) -> WaitSpec | NowSpec:
+    """Exactly one of `wait:` and `now:`. Presence counts, so `wait:` left empty is
+    still a wait block, and is refused for what it lacks rather than ignored."""
+    if "wait" in doc and "now" in doc:
+        raise ConfigError(f"{path}: 'wait:' and 'now:' cannot both be given — wait "
+                          f"queues for a card, now skips the queue. Keep one:\n"
+                          + _START_HELP)
+    if "now" in doc:
+        return _parse_now(doc["now"], f"{path}: now")
+    if "wait" in doc:
+        return _parse_wait(doc["wait"], f"{path}: wait")
+    raise ConfigError(f"{path}: missing 'wait:' or 'now:' — say how the list starts:\n"
+                      + _START_HELP)
+
+
+def _reject_bool_keys(raw: dict, where: str) -> None:
+    # YAML 1.1 reads bare on/off/yes/no as booleans, so `on:` becomes the key True
+    if True in raw or False in raw:
+        raise ConfigError(f"{where}: YAML parses a bare 'on:' / 'off:' key as a boolean. "
+                          f"Use 'gpu_index:' to name cards.")
+
+
+def _parse_number(raw: dict, key: str, cast, ok, unit: str, allowed: str, where: str):
+    """raw[key] cast and range-checked, or None when it is absent."""
+    if raw.get(key) is None:
+        return None
+    try:
+        value = cast(raw[key])
+    except (TypeError, ValueError):
+        raise ConfigError(f"{where}: '{key}' must be a number{unit}") from None
+    if not ok(value):
+        raise ConfigError(f"{where}: '{key}' out of range: {raw[key]!r} "
+                          f"(allowed: {allowed})")
+    return value
+
+
+def _parse_index(which: object, where: str) -> list[int] | None:
+    """`gpu_index:` as a list of cards; None means 'any'."""
+    if which in (None, "any"):
+        return None
+    if isinstance(which, int) and not isinstance(which, bool):
+        return [which]
+    if isinstance(which, list) and all(isinstance(x, int) and not isinstance(x, bool)
+                                       for x in which):
+        return list(which)
+    raise ConfigError(f"{where}: 'gpu_index' must be 'any', an index, "
+                      f"or a list of indices")
+
+
+def _parse_now(raw: object, where: str) -> NowSpec:
+    if raw == "cpu":
+        return NowSpec()
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{where}: 'now:' must be 'cpu', or a mapping with "
+                          f"'gpu_index' and 'gpu_free_gb'")
+    _reject_bool_keys(raw, where)
+    unknown = set(raw) - {"gpu_index", "gpu_free_gb"}
+    if unknown:
+        raise ConfigError(f"{where}: unknown key(s) under 'now:': {sorted(unknown)}. "
+                          f"'now:' takes only 'gpu_index' and 'gpu_free_gb': it starts "
+                          f"at once on the cards named, so the card count is the length "
+                          f"of gpu_index and nothing is waited for.")
+
+    index = _parse_index(raw.get("gpu_index"), where)
+    if not index:
+        raise ConfigError(f"{where}: 'now:' needs 'gpu_index' naming the card(s). "
+                          f"To let tm choose a card, use 'wait:'; for no GPU, 'now: cpu'.")
+    if len(set(index)) != len(index):
+        raise ConfigError(f"{where}: 'gpu_index' names a card twice: {index}")
+    need = _parse_number(raw, "gpu_free_gb", float, lambda v: v > 0, " (GiB)", "> 0",
+                         where)
+    if need is None:
+        raise ConfigError(f"{where}: 'now:' needs 'gpu_free_gb' — the VRAM each card "
+                          f"must have free at start, the one thing that can stop it.")
+    return NowSpec(gpu_index=index, gpu_free_gb=need)
+
 
 def _parse_wait(raw: object, where: str) -> WaitSpec:
     if raw is None:
-        return WaitSpec()
+        raw = {}                        # `wait:` left empty: say what it lacks
     if not isinstance(raw, dict):
         raise ConfigError(f"{where}: 'wait:' must be a mapping")
 
     known = {"gpu_free_gb", "gpus", "gpu_index", "stable_for", "timeout", "exclusive"}
-    # YAML 1.1 reads bare on/off/yes/no as booleans, so `on:` becomes the key True
-    if True in raw or False in raw:
-        raise ConfigError(f"{where}: YAML parses a bare 'on:' / 'off:' key as a boolean. "
-                          f"Use 'gpu_index:' to pick which cards are eligible.")
+    _reject_bool_keys(raw, where)
     unknown = set(raw) - known
     if unknown:
         hint = ""
@@ -173,45 +271,23 @@ def _parse_wait(raw: object, where: str) -> WaitSpec:
             ("stable_for",  float, lambda v: 0 <= v <= MAX_STABLE_FOR, " (seconds)",
              f"0..{MAX_STABLE_FOR:.0f}"),
             ("timeout",     float, lambda v: v >= 0, " (seconds)", ">= 0")):
-        if raw.get(key) is not None:
-            try:
-                value = cast(raw[key])
-            except (TypeError, ValueError):
-                raise ConfigError(f"{where}: '{key}' must be a number{unit}") from None
-            if not ok(value):
-                raise ConfigError(f"{where}: '{key}' out of range: {raw[key]!r} "
-                                  f"(allowed: {allowed})")
+        value = _parse_number(raw, key, cast, ok, unit, allowed, where)
+        if value is not None:
             setattr(spec, key, value)
+
+    if raw.get("gpu_free_gb") is None:
+        raise ConfigError(f"{where}: 'wait:' needs 'gpu_free_gb' — the VRAM it waits "
+                          f"for. For a list that needs no GPU, write 'now: cpu' instead.")
 
     if raw.get("exclusive") is not None:
         if not isinstance(raw["exclusive"], bool):
             raise ConfigError(f"{where}: 'exclusive' must be true or false")
         spec.exclusive = raw["exclusive"]
 
-    which = raw.get("gpu_index", "any")
-    if which in (None, "any"):
-        spec.gpu_index = None
-    elif isinstance(which, int) and not isinstance(which, bool):
-        spec.gpu_index = [which]
-    elif isinstance(which, list) and all(isinstance(x, int) and not isinstance(x, bool)
-                                         for x in which):
-        spec.gpu_index = list(which)
-    else:
-        raise ConfigError(f"{where}: 'gpu_index' must be 'any', an index, "
-                          f"or a list of indices")
-
-    if spec.manages_gpu:
-        if spec.gpu_index is not None and len(spec.gpu_index) < spec.gpus:
-            raise ConfigError(f"{where}: 'gpu_index' lists {len(spec.gpu_index)} gpu(s) "
-                              f"but 'gpus' is {spec.gpus}")
-    elif set(raw) - {"gpu_free_gb"}:
-        # Without gpu_free_gb nothing here manages a GPU, so pick() returns
-        # immediately and every other key is silently ignored. `gpus: 2` with
-        # `gpu_index: [0]` would parse clean and then run with no GPU at all.
-        raise ConfigError(
-            f"{where}: {sorted(set(raw) - {'gpu_free_gb'})} need 'gpu_free_gb' to mean "
-            f"anything — without it the list ignores GPUs and starts immediately.\n"
-            f"      Add 'gpu_free_gb:', or drop the 'wait:' block entirely.")
+    spec.gpu_index = _parse_index(raw.get("gpu_index", "any"), where)
+    if spec.gpu_index is not None and len(spec.gpu_index) < spec.gpus:
+        raise ConfigError(f"{where}: 'gpu_index' lists {len(spec.gpu_index)} gpu(s) "
+                          f"but 'gpus' is {spec.gpus}")
 
     return spec
 
@@ -325,8 +401,16 @@ def load_plan(path: Path) -> Plan:
         raise ConfigError(f"{path}: list name {name!r} — use letters, digits, "
                           f"'_', '-' only (it becomes part of a tmux session name)")
 
-    return Plan(tasks=tasks, cwd=cwd, name=name,
-                wait=_parse_wait(doc.get("wait"), f"{path}: wait"))
+    start = _parse_start(doc, path)
+    if not start.gpus:
+        # A cpu list is launched with no card visible, so `{GPU}` would expand to
+        # nothing and the command would quietly lose an argument.
+        for i, t in enumerate(tasks, start=1):
+            if any(m.group(1) in DEFERRED_VARS for m in _PLACEHOLDER_RE.finditer(t.cmd)):
+                raise ConfigError(f"{path}: tasks[{i}] uses {{GPU}}, but 'now: cpu' "
+                                  f"gives the list no card")
+
+    return Plan(tasks=tasks, cwd=cwd, name=name, start=start)
 
 
 # --------------------------------------------------------------------------- #

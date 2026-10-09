@@ -10,7 +10,7 @@ import sys
 from datetime import datetime
 
 from . import runner
-from .config import ConfigError, load_plan
+from .config import ConfigError, NowSpec, load_plan
 from .gpu import query_gpus
 from .store import TIME_FMT, Store
 
@@ -65,14 +65,20 @@ def _elapsed(stamp: str, until: str = "") -> str:
     return fmt_duration((t1 - t0).total_seconds())
 
 
-def describe_wait(spec, short: bool = False) -> str:
-    """One sentence describing what a list is waiting for.
+def describe_start(spec, short: bool = False) -> str:
+    """One sentence describing how a list starts: what it waits for, or that it doesn't.
 
     Shared by `tm ls` and `tm check`: check exists to preview what ls will show, so
     the two must not drift. `short` is the compact form for the queue table.
     """
-    if not spec.manages_gpu:
-        return "no gpu needed" if short else "no gpu requirement — starts immediately"
+    if isinstance(spec, NowSpec):
+        if not spec.gpus:
+            return "now, cpu" if short else "cpu only — no card visible"
+        where = "gpu " + ",".join(map(str, spec.gpu_index))
+        if short:
+            return f"now on {where}, {spec.gpu_free_gb:.0f}GiB"
+        return (f"on {where}, {spec.gpu_free_gb:.1f} GiB free per card or it is "
+                f"refused — skips the queue, stable_for and exclusive claims")
     where = ("gpu " + ",".join(map(str, spec.gpu_index))
              if spec.gpu_index is not None else "any gpu")
     if short:
@@ -119,7 +125,10 @@ def render(store: Store, st: Style, show_all: bool = False) -> list[str]:
         done, _, _ = run.scan()
         tasks = run.tasks
         idx = done + 1
-        gpu = describe_gpus(run.gpus, "-")
+        # A now: run says so, since nothing else shows it skipped the queue
+        gpu = describe_gpus(run.gpus, "cpu" if run.start == "now" else "-")
+        if run.start == "now" and run.gpus:
+            gpu = "now:" + gpu
         step = tasks[idx - 1].name if idx <= len(tasks) else "-"
         line = (f"  {run.name:<14} {gpu:<8} [{idx}/{len(tasks)}] {step:<12} "
                 f"{_elapsed(run.started):>7}")
@@ -143,7 +152,7 @@ def render(store: Store, st: Style, show_all: bool = False) -> list[str]:
     for path in queued:
         try:
             plan = load_plan(path)
-            note = describe_wait(plan.wait, short=True)
+            note = describe_start(plan.start, short=True)
             out.append(f"  {path.name:<24} {len(plan.tasks)} tasks   {st.dim(note)}")
         except ConfigError as exc:
             out.append(f"  {path.name:<24} {st.red('BAD: ' + str(exc).splitlines()[0])}")

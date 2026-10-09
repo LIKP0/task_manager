@@ -68,7 +68,7 @@ tm [--root DIR] <subcommand>
 | `tm` / `tm run` | Consume the queue. Stays resident and stands by when empty |
 | `tm ls [-a]` | Progress: running, queued, the newest 10 finished runs (`-a` for all), and used VRAM and utilisation per card |
 | `tm add F...` | Add yaml files to the queue. Each is parsed and capacity-checked first; a bad one is refused and never reaches the queue |
-| `tm check F` | Parse without running: how variables expand, what it will wait for, plus the device and capacity checks. Exit 2 if any fails |
+| `tm check F` | Parse without running: how variables expand, how it starts, plus the device and capacity checks. Exit 2 if any fails |
 | `tm attach [name]` | Attach to the running step. With a name, any tmux session containing it; lists them if several match |
 | `tm clean [-y]` | Remove tmux sessions left by failures. Lists them unless given `-y` |
 | `tm prune [-d N] [-n N] [-y]` | Delete finished runs from `archive/` past either limit (default 30 days / newest 30). Lists them unless given `-y` |
@@ -122,7 +122,7 @@ If you run with a custom `--root` or `TM_ROOT`, that directory needs its own cop
 ```yaml
 name: fused_tsample      # required; used in the run directory and session names
 
-wait:                    # optional: hold until enough GPU is free.
+wait:                    # this or now: (exactly one): hold until enough GPU is free
   gpu_free_gb: 50        # wait for a card with >= 50 GiB free
   gpus: 1                # how many cards
   gpu_index: any         # any | 0 | [0, 1]
@@ -146,7 +146,8 @@ tasks:
 | `cwd` | **Required.** The pane's starting directory, and so the base for every relative path in your commands (scripts, configs, output directories). No default: `tm add` copies the list into `queue/`, so anything relative to the yaml itself would drift |
 | `name` | **Required.** Appears in `tm ls`, the run directory name and tmux session names (`tm-<name>-<run id>-01-<task>`, where the run id is the run's start date and time). Never derived from the filename |
 | `vars` | Values for `{KEY}`, each a single value (no lists or mappings). A value is spliced into the command and then treated like the rest of it: `{GPU}` expands and `{{ }}` is a literal brace there too. No command-line override; fix them here before running |
-| `wait` | Start conditions, below |
+| `wait` | Queue until a card is free, below. **Exactly one of `wait` and `now` is required** |
+| `now` | Start at once on named cards, or `now: cpu`; see [Starting now](#starting-now) |
 
 `name` used to be derived from the filename, which also meant stripping the `010_`
 prefix that `tm add` adds — one implicit transform existing only to undo another,
@@ -181,15 +182,17 @@ checkpoint the previous step just wrote:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `gpu_free_gb` | none | Require at least this much free VRAM (**GiB**; nvidia-smi's MiB / 1024). Omit to ignore GPUs entirely |
+| `gpu_free_gb` | **required** | Require at least this much free VRAM (**GiB**; nvidia-smi's MiB / 1024) |
 | `gpus` | `1` | How many cards |
 | `gpu_index` | `any` | Restrict the candidates: `any` / `0` / `[0, 1]`. Must list at least `gpus` of them |
 | `stable_for` | `120` | **Seconds**, max 1800. How long the condition must hold continuously. The cap is the sample history tm keeps; a larger window could never be satisfied, so it is rejected rather than accepted and never met |
 | `timeout` | none | **Seconds** (`7200` = two hours). Give up on this list after waiting this long, mark it `timeout` and move on. **Omitting it means waiting for ever, not refusing to wait**, and that is the right default: a timeout does not keep the list queued, it takes the yaml out of `queue/` having run nothing, so a card that frees up on day four finds nothing to run. The clock is frozen while `tm hold` is in effect, but it lives only in tm's memory, so restarting tm restarts the count |
 | `exclusive` | `true` | No second tm run may share the card. `false` allows sharing, below |
 
-Every key except `gpu_free_gb` is rejected without it. `gpus: 2` with `gpu_index: [0]`
-and no `gpu_free_gb` used to parse clean and then run with no GPU management at all.
+`gpu_free_gb` is required: it is what the list waits for. Leaving out the whole
+`wait:` block used to mean "no GPU, start at once" — the same spelling for a CPU job
+and for a GPU job you had pinned to a card by hand, so tm could tell neither apart.
+Both are now said out loud with `now:`.
 
 `stable_for` is not optional padding. A job that just started is still reading data
 and has not built its memory pool, so nvidia-smi shows the card as empty; move in
@@ -250,6 +253,45 @@ So in shared mode `gpu_free_gb` means two things at once: "I need this much free
 Pairing takes the conservative side: **if either party asks for exclusive, the card is
 exclusive.** If A says `exclusive: true`, B cannot join even with `false` — otherwise
 A's declaration would mean nothing.
+
+### Starting now
+
+`now:` skips the queue. Use it to run something next to whatever tm is already
+running — a quick baseline beside a training job, or a CPU job:
+
+```yaml
+now:                     # on the cards named, as soon as tm sees the list
+  gpu_index: 1           # required: 1 | [0, 1]; the length is the card count
+  gpu_free_gb: 20        # required: VRAM each card must have free right now
+
+now: cpu                 # no card at all
+```
+
+**Only VRAM can stop a `now:` list.** Exclusive claims, `stable_for`, queue order and
+the cards reserved by lists above it are agreements between waiting lists, and `now:`
+is you overriding them. The two VRAM tests from
+[Exclusive and shared](#exclusive-and-shared) still apply, measured once, this tick:
+
+| Test | Criterion |
+|---|---|
+| Measured free | nvidia-smi free >= `gpu_free_gb` |
+| Declared budget | card total - sum of budgets of tm runs on it >= `gpu_free_gb` |
+
+The second test is what keeps you off a tm run that has just started and still looks
+empty. If either test fails on any named card, the list is **refused, not queued**:
+it goes to `archive/` as `ABORT` with the numbers in run.yaml's `note`, and tm prints them.
+Waiting would make it a queued list that ignores exclusive and jumps the queue, which
+is not what "now" means. Fix the card or the number and add it again.
+
+Once started it is a run like any other: `CUDA_VISIBLE_DEVICES` and `{GPU}` are set to
+its cards, the device check applies, and its claim on the card is **exclusive**, so
+waiting lists keep off. `tm ls` shows it as `now:gpu1`.
+
+`now: cpu` launches with `CUDA_VISIBLE_DEVICES` set empty, so a task that reaches for
+cuda fails at once instead of quietly landing on gpu0. `{GPU}` in such a list is
+rejected at parse time; there is no card for it to name.
+
+`now:` takes no other key. `wait:` and `now:` together, or neither, is an error.
 
 ## Scheduling
 
@@ -383,7 +425,7 @@ Points worth knowing:
 ### The task's environment
 
 tm injects two environment variables: `PYTHONUNBUFFERED=1`, and `CUDA_VISIBLE_DEVICES`
-when a card was acquired.
+set to the run's cards — empty for `now: cpu`.
 
 Everything else comes from tmux, not from tm. Measured on tmux 3.2a: the pane gets
 tm's `PATH`, but every other variable comes from the environment the **tmux server**
@@ -423,7 +465,7 @@ Every run ends in one of six states, shown in the `RECENT` column:
 | `FAILED` | A step exited non-zero; the rest were skipped. The line gives `step<N> <name> rc=<code>` |
 | `LOST` | The session vanished with no exit code — **treated as a failure**, since no evidence means failure |
 | `TIMOUT` | `wait.timeout` expired before a card was free; it never started |
-| `ABORT` | Refused before starting (usually the `trainer.devices` check), or the session could not be launched |
+| `ABORT` | Refused before starting (the `trainer.devices` check, or a `now:` list whose cards lack the VRAM), or the session could not be launched |
 | `BROKEN` | The run directory has no readable `run.yaml`. It is never reported as done — a run that executed nothing must not look successful |
 
 `tm ls` looks roughly like this:
@@ -498,8 +540,8 @@ tm: ddpm_fdg failed the config device check, skipping:
       trainer.devices is [1], must be [0] (or 1, -1, auto) — tm assigns the physical card via CUDA_VISIBLE_DEVICES
 ```
 
-The check applies only to lists with `gpu_free_gb`, since only they get
-`CUDA_VISIBLE_DEVICES`. It runs in `tm check`, and again when the list reaches the
+The check applies to every list with a card (`wait:`, or `now:` with `gpu_index`),
+since their cards are remapped through `CUDA_VISIBLE_DEVICES`. It runs in `tm check`, and again when the list reaches the
 front of the queue, where a failing list is marked `ABORT` and moved to `archive/`
 instead of retrying for ever. `tm add` does not run it.
 

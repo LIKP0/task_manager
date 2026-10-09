@@ -37,13 +37,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from tmlib import runner
-from tmlib.config import (ConfigError, check_device_settings, load_plan,
+from tmlib.config import (ConfigError, NowSpec, check_device_settings, load_plan,
                           unescape_braces)
 from tmlib.gpu import Gpu, GpuPool, capacity_problem, query_gpus
 from tmlib.settings import Settings, config_path, load_settings
 from tmlib.store import (TIME_FMT, LockBusy, Store, StoreError,
                          now_stamp as store_now)
-from tmlib.view import Style, describe_wait, render
+from tmlib.view import Style, describe_start, render
 
 
 # --------------------------------------------------------------------------- #
@@ -271,9 +271,10 @@ def _print_tail(rec, st: Style, lines: int = 12) -> None:
 
 
 def _launch(run, idx: int, rec, sess: runner.Session, pool: GpuPool, st: Style) -> None:
-    env = {"PYTHONUNBUFFERED": "1"}
-    if run.gpus:
-        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in run.gpus)
+    # Empty for a cpu run: a task that reaches for cuda anyway fails at once rather
+    # than quietly landing on gpu0.
+    env = {"PYTHONUNBUFFERED": "1",
+           "CUDA_VISIBLE_DEVICES": ",".join(str(g) for g in run.gpus)}
     try:
         sess.launch(rec.cmd, Path(run.cwd), env, run.script_path(idx))
     except (runner.TmuxError, OSError) as exc:
@@ -351,19 +352,34 @@ def _start_pending(store: Store, pool: GpuPool, st: Style, args,
         if complained.get(path) == "parse":
             del complained[path]        # it parses now; a claim failure is separate
 
-        gpus = pool.pick(plan.wait)
-        if gpus is None:
-            first = waiting_since.setdefault(path, now)
-            if plan.wait.timeout is not None and now - first >= plan.wait.timeout:
-                if _claim(store, path, plan, [], st, complained, state="timeout") is None:
+        spec = plan.start
+        if isinstance(spec, NowSpec):
+            if spec.gpus and pool.error:
+                continue                # VRAM unreadable this tick; it is not refused
+            gpus = list(spec.gpu_index)
+            if spec.gpus and (problem := pool.room_now(spec)):
+                # now: means now. Waiting would turn it into a queued list that
+                # ignores exclusive and jumps the queue, so it is refused instead.
+                if _claim(store, path, plan, [], st, complained,
+                          state="aborted", note=problem) is None:
                     continue
-                waiting_since.pop(path, None)
-                print(st.yellow(f"tm: {plan.name} timed out waiting for a gpu "
-                                f"({plan.wait.timeout:.0f}s), skipping"))
-            continue
+                print(st.red(f"tm: {plan.name} cannot start now: {problem}"))
+                continue
+        else:
+            gpus = pool.pick(spec)
+            if gpus is None:
+                first = waiting_since.setdefault(path, now)
+                if spec.timeout is not None and now - first >= spec.timeout:
+                    if _claim(store, path, plan, [], st, complained,
+                              state="timeout") is None:
+                        continue
+                    waiting_since.pop(path, None)
+                    print(st.yellow(f"tm: {plan.name} timed out waiting for a gpu "
+                                    f"({spec.timeout:.0f}s), skipping"))
+                continue
 
-        if plan.wait.manages_gpu and args.settings.device_check:
-            problems = check_device_settings(plan.tasks, plan.cwd, plan.wait.gpus)
+        if spec.gpus and args.settings.device_check:
+            problems = check_device_settings(plan.tasks, plan.cwd, spec.gpus)
             if problems:
                 # Do not let it retry forever in the queue: move it out and explain
                 if _claim(store, path, plan, [], st, complained,
@@ -379,11 +395,11 @@ def _start_pending(store: Store, pool: GpuPool, st: Style, args,
         run = _claim(store, path, plan, gpus, st, complained)
         if run is None:
             continue
-        pool.allocate(gpus, run.path.name, plan.wait.gpu_free_gb or 0.0,
-                      plan.wait.exclusive)
+        pool.allocate(gpus, run.path.name, spec.gpu_free_gb, spec.exclusive)
         waiting_since.pop(path, None)
-        where = ",".join(f"gpu{g}" for g in gpus) or "no gpu"
-        print(st.bold(f"\ntm: start {plan.name} on {where}  ({len(plan.tasks)} tasks)"))
+        where = ",".join(f"gpu{g}" for g in gpus) or "cpu"
+        how = "  [now]" if isinstance(spec, NowSpec) else ""
+        print(st.bold(f"\ntm: start {plan.name} on {where}{how}  ({len(plan.tasks)} tasks)"))
         _try_advance(store, run, pool, st, stuck)
 
 
@@ -431,11 +447,11 @@ def cmd_add(store: Store, args, st: Style) -> int:
         # that no card here can satisfy would sit in the queue looking like it was
         # waiting its turn, for ever. Deliberately not folded into the ConfigError
         # above: that exception means the yaml is wrong, and this one does not.
-        if plan.wait.manages_gpu and cards is None:
+        if plan.start.gpus and cards is None:
             # Only the sizes are read, so a busy card is irrelevant; sampled here
             # rather than up front so a batch of cpu-only lists never shells out.
             cards = _machine_cards(st)
-        if problem := capacity_problem(plan.wait, cards or []):
+        if problem := capacity_problem(plan.start, cards or []):
             print(st.red(f"error: {src}: {problem}"), file=sys.stderr)
             rc = 2
             continue
@@ -465,17 +481,18 @@ def cmd_check(store: Store, args, st: Style) -> int:
     except ConfigError as exc:
         print(st.red(f"error: {exc}"), file=sys.stderr)
         return 2
-    spec = plan.wait
+    spec = plan.start
     print(st.bold(f"{plan.name}: {len(plan.tasks)} tasks, cwd={plan.cwd}"))
     # Same renderer `tm ls` uses, so check cannot describe a list differently from
     # what you will see once it is queued.
-    print(st.cyan("  [wait] ") + describe_wait(spec))
+    label = "  [now]  " if isinstance(spec, NowSpec) else "  [wait] "
+    print(st.cyan(label) + describe_start(spec))
     for i, t in enumerate(plan.tasks, start=1):
         # Unescape `{{` / `}}` before display, or check would show something other
         # than what the shell receives. `{GPU}` is left alone: the card is only
         # decided at claim time and is unknown here.
         print(f"  {st.cyan(f'[{i}] {t.name}')}  {unescape_braces(t.cmd)}")
-    if spec.manages_gpu:
+    if spec.gpus:
         problems = check_device_settings(plan.tasks, plan.cwd, spec.gpus)
         if problem := capacity_problem(spec, _machine_cards(st)):
             problems.append(problem)

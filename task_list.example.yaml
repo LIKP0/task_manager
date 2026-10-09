@@ -37,14 +37,19 @@ cwd: ~/YourProject      # your project root. tm checks that it exists, so runnin
 # ---------------------------------------------------------------------------
 # wait: hold until enough GPU is free.
 #
-# The whole block is optional. Without it the list ignores GPUs and starts as soon
-# as it reaches the front of the queue (fine for CPU-only preprocessing).
+# A list has exactly one of wait: and now:. now: skips the queue instead:
+#
+#   now:                  # start at once on gpu1, past exclusive claims and queue
+#     gpu_index: 1        # order; refused (not queued) if gpu1 lacks 20 GiB free
+#     gpu_free_gb: 20
+#
+#   now: cpu              # start at once with no card (CUDA_VISIBLE_DEVICES empty)
 #
 # Cards are held for the whole list: train/test/eval never switch cards and cannot
 # be taken over between steps.
 # ---------------------------------------------------------------------------
 wait:
-  # Free VRAM required, in GiB. Use your peak usage plus some headroom.
+  # Required: free VRAM to wait for, in GiB. Use your peak usage plus some headroom.
   gpu_free_gb: 50
 
   # How many cards. Multiple cards are acquired atomically — all at once or none —
