@@ -9,14 +9,17 @@ $ tm ls
 tm: pid 31337 since 2026-08-08 14:20:11
 
 RUNNING
-  ccfm_c         gpu1     [2/3] test           1h04m  -> tmux attach -t tm-ccfm_c-20260808-143301-02-test
+  list    gpu   step         time
+  ccfm_c  gpu1  [2/3] test  1h04m  -> tmux attach -t tm-ccfm_c-20260808-143301-02-test
 
 QUEUED   (order = priority; rename to change it)
-  020_ddpm_fdg.yaml        2 tasks   1x50GiB on any gpu
+  file               tasks    start
+  020_ddpm_fdg.yaml  2 tasks  1x50GiB on any gpu
 
 RECENT
-  ok      unet_base      3/3    5h12m  08-08 13:02
-  FAILED  unet_wide      1/3    2m00s  08-08 07:49  step2 test rc=1
+  state   list       steps   took  finished
+  ok      unet_base    3/3  5h12m  08-08 13:02
+  FAILED  unet_wide    1/3  2m00s  08-08 07:49  step2 test rc=1
 
 GPUS
   gpu0:   42.8/95.6 GiB used   util 100%

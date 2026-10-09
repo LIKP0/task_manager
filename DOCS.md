@@ -464,7 +464,7 @@ Every run ends in one of six states, shown in the `RECENT` column:
 | `ok` | Every step exited 0 |
 | `FAILED` | A step exited non-zero; the rest were skipped. The line gives `step<N> <name> rc=<code>` |
 | `LOST` | The session vanished with no exit code — **treated as a failure**, since no evidence means failure |
-| `TIMOUT` | `wait.timeout` expired before a card was free; it never started |
+| `TIMEOUT` | `wait.timeout` expired before a card was free; it never started |
 | `ABORT` | Refused before starting (the `trainer.devices` check, or a `now:` list whose cards lack the VRAM), or the session could not be launched |
 | `BROKEN` | The run directory has no readable `run.yaml`. It is never reported as done — a run that executed nothing must not look successful |
 
@@ -474,15 +474,18 @@ Every run ends in one of six states, shown in the `RECENT` column:
 tm: pid 31337 since 2026-08-08 14:20:11
 
 RUNNING
-  ccfm_c         gpu1     [2/3] test           1h04m  -> tmux attach -t tm-ccfm_c-20260808-143301-02-test
+  list    gpu   step         time
+  ccfm_c  gpu1  [2/3] test  1h04m  -> tmux attach -t tm-ccfm_c-20260808-143301-02-test
 
 QUEUED   (order = priority; rename to change it)
-  020_ddpm_fdg.yaml        2 tasks   1x50GiB on any gpu
-  030_broken.yaml          BAD: .../queue/030_broken.yaml: missing 'tasks:'
+  file               tasks    start
+  020_ddpm_fdg.yaml  2 tasks  1x50GiB on any gpu
+  030_broken.yaml             BAD: .../queue/030_broken.yaml: missing 'tasks:'
 
 RECENT
-  ok      tok            3/3       3s  08-08 23:49
-  FAILED  tpipe          0/2       1s  08-08 23:49  step1 piped rc=3
+  state   list   steps  took  finished
+  ok      tok      3/3    3s  08-08 23:49
+  FAILED  tpipe    0/2    1s  08-08 23:49  step1 piped rc=3
   ... 14 more, tm ls -a for all
 
 GPUS
@@ -493,7 +496,8 @@ GPUS
 The first line says `not running` when no tm holds the lock (it tries the flock
 rather than trusting the pid written in the file, which outlives a hard-killed tm),
 and adds `[queue paused · tm resume]` during a hold. A running step whose session has
-already vanished shows `session gone` until the next tick marks it LOST. The GPU
+already vanished shows `session gone` until the next tick marks it LOST. In the
+`gpu` column, `now:gpu1` is a `now:` run and `cpu` a `now: cpu` one. The GPU
 figures are coloured red when a card has under 5 GiB free and yellow above 50%
 utilisation.
 

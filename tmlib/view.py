@@ -93,6 +93,21 @@ def describe_gpus(indices: list[int], empty: str) -> str:
     return ",".join(f"gpu{g}" for g in indices) or empty
 
 
+def _columns(rows: list[list[str]], right: frozenset[int] = frozenset()) -> list[list[str]]:
+    """Pad every cell to the widest in its column, so columns line up however long
+    the names are. Plain text only: escape codes would count as width, so style a
+    cell after padding it."""
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+    return [[cell.rjust(w) if i in right else cell.ljust(w)
+             for i, (cell, w) in enumerate(zip(row, widths))] for row in rows]
+
+
+# Finished states as `tm ls` spells them, and their colour
+_STATE_MARK = {"done": ("ok", "green"), "failed": ("FAILED", "red"),
+               "lost": ("LOST", "red"), "timeout": ("TIMEOUT", "yellow"),
+               "aborted": ("ABORT", "yellow"), "broken": ("BROKEN", "red")}
+
+
 def render(store: Store, st: Style, show_all: bool = False) -> list[str]:
     """The complete output of `tm ls`."""
     out: list[str] = []
@@ -118,44 +133,64 @@ def render(store: Store, st: Style, show_all: bool = False) -> list[str]:
     out.append(line)
 
     # ---- running ---------------------------------------------------------------
+    # Each table is laid out as plain text first, with a dim header row, then styled
     if active:
         out.append("")
         out.append(st.bold("RUNNING"))
-    for run in active:
-        done, _, _ = run.scan()
-        tasks = run.tasks
-        idx = done + 1
-        # A now: run says so, since nothing else shows it skipped the queue
-        gpu = describe_gpus(run.gpus, "cpu" if run.start == "now" else "-")
-        if run.start == "now" and run.gpus:
-            gpu = "now:" + gpu
-        step = tasks[idx - 1].name if idx <= len(tasks) else "-"
-        line = (f"  {run.name:<14} {gpu:<8} [{idx}/{len(tasks)}] {step:<12} "
-                f"{_elapsed(run.started):>7}")
+        rows, tails = [["list", "gpu", "step", "time"]], [""]
+        for run in active:
+            done, _, _ = run.scan()
+            tasks = run.tasks
+            idx = done + 1
+            # A now: run says so, since nothing else shows it skipped the queue. "-" is
+            # a run from before now: existed that tm booked no card for.
+            gpu = describe_gpus(run.gpus, "cpu" if run.start == "now" else "-")
+            if run.start == "now" and run.gpus:
+                gpu = "now:" + gpu
+            step = tasks[idx - 1].name if idx <= len(tasks) else "-"
+            rows.append([run.name, gpu, f"[{idx}/{len(tasks)}] {step}",
+                         _elapsed(run.started)])
 
-        if idx <= len(tasks) and tasks[idx - 1].session:
-            sess = runner.Session(tasks[idx - 1].session)
-            if sess.name in sessions:
-                silent = sess.silent_for()
-                if silent is not None and silent >= SILENT_WARN:
-                    line += st.yellow(f"  ⚠ silent {fmt_duration(silent)}")
-                line += st.dim(f"  -> tmux attach -t {sess.name}")
-            else:
-                line += st.red("  session gone")
-        out.append(line)
+            tail = ""
+            if idx <= len(tasks) and tasks[idx - 1].session:
+                sess = runner.Session(tasks[idx - 1].session)
+                if sess.name in sessions:
+                    silent = sess.silent_for()
+                    if silent is not None and silent >= SILENT_WARN:
+                        tail += st.yellow(f"  ⚠ silent {fmt_duration(silent)}")
+                    tail += st.dim(f"  -> tmux attach -t {sess.name}")
+                else:
+                    tail += st.red("  session gone")
+            tails.append(tail)
+        for i, (cells, tail) in enumerate(zip(_columns(rows, right=frozenset({3})), tails)):
+            if i == 0:
+                out.append(st.dim("  " + "  ".join(cells).rstrip()))
+                continue
+            name, gpu, step, took = cells
+            out.append(f"  {st.bold(name)}  {st.cyan(gpu)}  {step}  {took}{tail}")
 
     # ---- queued ----------------------------------------------------------------
     queued = store.queued()
     if queued:
         out.append("")
         out.append(st.bold("QUEUED") + st.dim("   (order = priority; rename to change it)"))
-    for path in queued:
-        try:
-            plan = load_plan(path)
-            note = describe_start(plan.start, short=True)
-            out.append(f"  {path.name:<24} {len(plan.tasks)} tasks   {st.dim(note)}")
-        except ConfigError as exc:
-            out.append(f"  {path.name:<24} {st.red('BAD: ' + str(exc).splitlines()[0])}")
+        rows, bad = [["file", "tasks", "start"]], [False]
+        for path in queued:
+            try:
+                plan = load_plan(path)
+                rows.append([path.name, f"{len(plan.tasks)} tasks",
+                             describe_start(plan.start, short=True)])
+                bad.append(False)
+            except ConfigError as exc:
+                rows.append([path.name, "", "BAD: " + str(exc).splitlines()[0]])
+                bad.append(True)
+        for i, cells in enumerate(_columns(rows)):
+            if i == 0:
+                out.append(st.dim("  " + "  ".join(cells).rstrip()))
+                continue
+            name, ntasks, note = cells
+            note = st.red(note.rstrip()) if bad[i] else st.dim(note.rstrip())
+            out.append(f"  {name}  {ntasks}  {note}")
 
     # ---- finished --------------------------------------------------------------
     # Newest first, capped at RECENT_SHOWN. The cut is always announced: a list that
@@ -163,21 +198,29 @@ def render(store: Store, st: Style, show_all: bool = False) -> list[str]:
     if finished:
         out.append("")
         out.append(st.bold("RECENT"))
-    for run in finished:
-        done, fail_i, fail_rc = run.scan()
-        tasks = run.tasks
-        mark = {"done": st.green("ok    "), "failed": st.red("FAILED"),
-                "lost": st.red("LOST  "), "timeout": st.yellow("TIMOUT"),
-                "aborted": st.yellow("ABORT "),
-                "broken": st.red("BROKEN")}.get(run.state, run.state[:6].ljust(6))
-        line = (f"  {mark}  {run.name:<14} {done}/{len(tasks)}  "
-                f"{_elapsed(run.started, run.finished):>7}  {st.dim(run.finished[5:16])}")
-        if fail_i and fail_i <= len(tasks):
-            rec = tasks[fail_i - 1]
-            line += f"  {st.red(f'step{fail_i} {rec.name} rc={fail_rc}')}"
-            if rec.session in sessions:
-                line += st.dim(f"  -> tmux attach -t {rec.session}")
-        out.append(line)
+        rows, colours, tails = [["state", "list", "steps", "took", "finished"]], [""], [""]
+        for run in finished:
+            done, fail_i, fail_rc = run.scan()
+            tasks = run.tasks
+            mark, colour = _STATE_MARK.get(run.state, (run.state, ""))
+            rows.append([mark, run.name, f"{done}/{len(tasks)}",
+                         _elapsed(run.started, run.finished), run.finished[5:16]])
+            colours.append(colour)
+            tail = ""
+            if fail_i and fail_i <= len(tasks):
+                rec = tasks[fail_i - 1]
+                tail += f"  {st.red(f'step{fail_i} {rec.name} rc={fail_rc}')}"
+                if rec.session in sessions:
+                    tail += st.dim(f"  -> tmux attach -t {rec.session}")
+            tails.append(tail)
+        laid = _columns(rows, right=frozenset({2, 3}))
+        for i, (cells, colour, tail) in enumerate(zip(laid, colours, tails)):
+            if i == 0:
+                out.append(st.dim("  " + "  ".join(cells).rstrip()))
+                continue
+            mark, name, steps, took, ended = cells
+            mark = getattr(st, colour)(mark) if colour else mark
+            out.append(f"  {mark}  {name}  {steps}  {took}  {st.dim(ended)}{tail}")
     if hidden:
         out.append(st.dim(f"  ... {hidden} more, tm ls -a for all"))
 
