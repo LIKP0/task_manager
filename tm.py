@@ -272,8 +272,10 @@ def _print_tail(rec, st: Style, lines: int = 12) -> None:
 
 def _launch(run, idx: int, rec, sess: runner.Session, pool: GpuPool, st: Style) -> None:
     # Empty for a cpu run: a task that reaches for cuda anyway fails at once rather
-    # than quietly landing on gpu0.
+    # than quietly landing on gpu0. The card numbers are nvidia-smi's (PCI order);
+    # CUDA's default fastest-first order would map them to other cards on a mixed box.
     env = {"PYTHONUNBUFFERED": "1",
+           "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
            "CUDA_VISIBLE_DEVICES": ",".join(str(g) for g in run.gpus)}
     try:
         sess.launch(rec.cmd, Path(run.cwd), env, run.script_path(idx))

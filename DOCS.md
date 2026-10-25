@@ -424,8 +424,11 @@ Points worth knowing:
 
 ### The task's environment
 
-tm injects two environment variables: `PYTHONUNBUFFERED=1`, and `CUDA_VISIBLE_DEVICES`
-set to the run's cards — empty for `now: cpu`.
+tm injects three environment variables: `PYTHONUNBUFFERED=1`, `CUDA_VISIBLE_DEVICES`
+set to the run's cards — empty for `now: cpu` — and `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so
+those card numbers mean what they mean in `nvidia-smi`. CUDA's default order puts the
+fastest cards first, which on a machine with mixed card models sends a run to a card
+other than the one tm booked.
 
 Everything else comes from tmux, not from tm. Measured on tmux 3.2a: the pane gets
 tm's `PATH`, but every other variable comes from the environment the **tmux server**
